@@ -9,13 +9,13 @@ struct InputSource: Hashable {
 
 final class InputSourceLockService {
   private enum Timing {
-    static let enforceDelay: TimeInterval = 0.05
+    static let enforceDelay: TimeInterval = 0.01
     static let periodicCheckInterval: TimeInterval = 5.0
   }
 
   private let log = Logger(subsystem: AppConstants.loggerSubsystem, category: "InputSourceLockService")
   private let defaults = UserDefaults.standard
-  private let distributedNotificationCenter = DistributedNotificationCenter.default()
+  private let systemNotificationCenter = NotificationCenter.default
   private let workspaceNotificationCenter = NSWorkspace.shared.notificationCenter
   private var enforceWorkItem: DispatchWorkItem?
   private var periodicCheckTimer: Timer?
@@ -34,7 +34,7 @@ final class InputSourceLockService {
 
   deinit {
     periodicCheckTimer?.invalidate()
-    distributedNotificationCenter.removeObserver(self)
+    systemNotificationCenter.removeObserver(self)
     workspaceNotificationCenter.removeObserver(self)
   }
 
@@ -90,13 +90,15 @@ final class InputSourceLockService {
   }
 
   private func observeSystemNotifications() {
-    distributedNotificationCenter.addObserver(
+    // TIS 通知是本地系统通知，必须通过 NotificationCenter.default 接收
+    // （DistributedNotificationCenter 无法收到这类通知）
+    systemNotificationCenter.addObserver(
       self,
       selector: #selector(inputSourceChanged(_:)),
       name: NSNotification.Name(kTISNotifySelectedKeyboardInputSourceChanged as String),
       object: nil
     )
-    distributedNotificationCenter.addObserver(
+    systemNotificationCenter.addObserver(
       self,
       selector: #selector(inputSourcesEnabledChanged(_:)),
       name: NSNotification.Name(kTISNotifyEnabledKeyboardInputSourcesChanged as String),
