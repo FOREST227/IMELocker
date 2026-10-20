@@ -1,6 +1,8 @@
 <div align="center">
 
-# 🔒 输入法锁定
+<img src="Resources/AppIcon.png" width="112" height="112" alt="输入法锁定 App 图标">
+
+# 输入法锁定
 
 **让 Mac 留在你想用的输入法。**
 
