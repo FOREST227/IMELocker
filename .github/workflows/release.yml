@@ -5,6 +5,10 @@ on:
     tags:
       - "v*"
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: macos-latest
@@ -15,36 +19,28 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Get version
-        id: version
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-
-      - name: Build universal DMG
-        run: bash scripts/build_dmg.sh "${{ steps.version.outputs.version }}" universal
-
-      - name: Build x86_64 DMG
-        run: bash scripts/build_dmg.sh "${{ steps.version.outputs.version }}" x86_64
-
-      - name: Build arm64 DMG
-        run: bash scripts/build_dmg.sh "${{ steps.version.outputs.version }}" arm64
-
-      - name: Create Release
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Validate release version
         run: |
-          # 读取 release notes
-          NOTES_FILE="docs/releases/${GITHUB_REF_NAME}.md"
-          if [[ -f "${NOTES_FILE}" ]]; then
-            BODY="$(cat "${NOTES_FILE}")"
-          else
-            BODY=""
+          VERSION="${GITHUB_REF_NAME#v}"
+          APP_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/Info.plist)"
+          if [[ "$VERSION" != "$APP_VERSION" ]]; then
+            echo "Tag $VERSION does not match Info.plist $APP_VERSION" >&2
+            exit 1
           fi
 
-          # 删除可能存在的旧 release（静默处理不存在的情况）
-          gh release delete "${GITHUB_REF_NAME}" --yes 2>/dev/null || true
+      - name: Regression tests
+        run: bash scripts/test.sh
 
-          # 创建新 release 并上传 DMG
-          gh release create "${GITHUB_REF_NAME}" \
-            build/IMELocker-*.dmg \
-            --title "${GITHUB_REF_NAME}" \
-            --notes "${BODY}"
+      - name: Compile both architectures and prepare three app bundles
+        run: bash build.sh --target all
+
+      - name: Package verified DMGs without recompiling
+        run: |
+          for target in universal x86_64 arm64; do
+            bash scripts/build_dmg.sh "${GITHUB_REF_NAME#v}" "$target" --skip-build
+          done
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/publish_release.sh "$GITHUB_REF_NAME"

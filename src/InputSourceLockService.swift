@@ -14,8 +14,9 @@ final class InputSourceLockService {
   }
 
   private let log = Logger(subsystem: AppConstants.loggerSubsystem, category: "InputSourceLockService")
-  private let defaults = UserDefaults.standard
-  private let systemNotificationCenter = NotificationCenter.default
+  private let defaults: UserDefaults
+  private let system: InputSourceSystem
+  private let systemNotificationCenter: DistributedNotificationCenter
   private let workspaceNotificationCenter = NSWorkspace.shared.notificationCenter
   private var enforceWorkItem: DispatchWorkItem?
   private var periodicCheckTimer: Timer?
@@ -32,7 +33,26 @@ final class InputSourceLockService {
     static let targetID = "targetInputSourceID"
   }
 
+  init(
+    defaults: UserDefaults = .standard,
+    system: InputSourceSystem = CarbonInputSourceSystem(),
+    notificationCenter: DistributedNotificationCenter = .default()
+  ) {
+    self.defaults = defaults
+    self.system = system
+    self.systemNotificationCenter = notificationCenter
+  }
+
+  var lockStatus: LockStatus {
+    guard isEnabled else { return .disabled }
+    guard targetInputSourceID != nil else { return .noTarget }
+    guard targetInputSource() != nil else { return .targetUnavailable }
+    guard !isSecureInputEnabled else { return .paused }
+    return currentInputSource()?.id == targetInputSourceID ? .locked : .restoring
+  }
+
   deinit {
+    enforceWorkItem?.cancel()
     periodicCheckTimer?.invalidate()
     systemNotificationCenter.removeObserver(self)
     workspaceNotificationCenter.removeObserver(self)
@@ -54,8 +74,9 @@ final class InputSourceLockService {
     set {
       defaults.set(newValue, forKey: DefaultsKey.enabled)
       if newValue {
-        startPeriodicCheck()
+        if hasStarted { startPeriodicCheck() }
       } else {
+        enforceWorkItem?.cancel()
         periodicCheckTimer?.invalidate()
         periodicCheckTimer = nil
       }
@@ -76,7 +97,7 @@ final class InputSourceLockService {
   }
 
   var isSecureInputEnabled: Bool {
-    IsSecureEventInputEnabled()
+    system.isSecureInputEnabled
   }
 
   func start() {
@@ -90,19 +111,20 @@ final class InputSourceLockService {
   }
 
   private func observeSystemNotifications() {
-    // TIS 通知是本地系统通知，必须通过 NotificationCenter.default 接收
-    // （DistributedNotificationCenter 无法收到这类通知）
+    // Carbon TIS posts CF distributed notifications, not local Foundation notifications.
     systemNotificationCenter.addObserver(
       self,
       selector: #selector(inputSourceChanged(_:)),
       name: NSNotification.Name(kTISNotifySelectedKeyboardInputSourceChanged as String),
-      object: nil
+      object: nil,
+      suspensionBehavior: .deliverImmediately
     )
     systemNotificationCenter.addObserver(
       self,
       selector: #selector(inputSourcesEnabledChanged(_:)),
       name: NSNotification.Name(kTISNotifyEnabledKeyboardInputSourcesChanged as String),
-      object: nil
+      object: nil,
+      suspensionBehavior: .deliverImmediately
     )
 
     workspaceNotificationCenter.addObserver(
@@ -132,29 +154,16 @@ final class InputSourceLockService {
     if let cached = cachedSelectableSources {
       return cached
     }
-    let sources = fetchSelectableInputSources()
+    let sources = system.selectableInputSources()
     cachedSelectableSources = sources
     return sources
   }
 
-  func currentInputSource() -> InputSource? {
-    guard let unmanaged = TISCopyCurrentKeyboardInputSource() else { return nil }
-    let source = unmanaged.takeRetainedValue()
-    guard let id = stringProperty(source, kTISPropertyInputSourceID) else { return nil }
-    guard let name = stringProperty(source, kTISPropertyLocalizedName) else { return nil }
-    return InputSource(id: id, name: name)
-  }
+  func currentInputSource() -> InputSource? { system.currentInputSource() }
 
   func targetInputSource() -> InputSource? {
     guard let id = targetInputSourceID else { return nil }
-    // 优先从缓存中查找，避免重复调用 TISCreateInputSourceList
-    if let cached = cachedSelectableSources {
-      return cached.first(where: { $0.id == id })
-    }
-    return inputSourceRef(byID: id).flatMap { ref in
-      guard let name = stringProperty(ref, kTISPropertyLocalizedName) else { return nil }
-      return InputSource(id: id, name: name)
-    }
+    return selectableInputSources().first(where: { $0.id == id })
   }
 
   func enforce(reason: String) {
@@ -175,6 +184,7 @@ final class InputSourceLockService {
   }
 
   private func enforceNow(reason: String) {
+    defer { notifyStateChanged() }
     guard isEnabled else { return }
     guard !isSecureInputEnabled else { return }
     guard let targetID = targetInputSourceID else { return }
@@ -182,12 +192,11 @@ final class InputSourceLockService {
     let current = currentInputSource()
     if current?.id == targetID { return }
 
-    guard let targetRef = inputSourceRef(byID: targetID) else {
+    guard let status = system.selectInputSource(id: targetID) else {
       log.error("Target input source not found: \(targetID, privacy: .public)")
       return
     }
 
-    let status = TISSelectInputSource(targetRef)
     if status != noErr {
       log.error("TISSelectInputSource failed: \(status, privacy: .public) reason=\(reason, privacy: .public)")
     } else {
@@ -219,6 +228,7 @@ final class InputSourceLockService {
   @objc private func inputSourcesEnabledChanged(_ notification: Notification) {
     cachedSelectableSources = nil
     autoPickWeChatIfNeeded()
+    enforce(reason: "inputSourcesEnabledChanged")
     notifyStateChanged()
   }
 
@@ -229,17 +239,10 @@ final class InputSourceLockService {
 
   private func handlePeriodicCheck() {
     guard isEnabled else { return }
-    guard targetInputSourceID != nil else { return }
-
+    // Also refresh the list as a fallback for missed distributed notifications.
+    cachedSelectableSources = nil
+    autoPickWeChatIfNeeded()
     enforce(reason: "periodicCheck")
-  }
-
-  private func inputSourceRef(byID id: String) -> TISInputSource? {
-    let filter = [kTISPropertyInputSourceID: id] as CFDictionary
-    guard let list = TISCreateInputSourceList(filter, false)?.takeRetainedValue() as? [TISInputSource] else {
-      return nil
-    }
-    return list.first
   }
 
   private func matchesWeChatByName(_ source: InputSource) -> Bool {
@@ -250,48 +253,6 @@ final class InputSourceLockService {
   private func matchesWeChatByID(_ source: InputSource) -> Bool {
     let normalizedID = source.id.lowercased()
     return normalizedID.contains("tencent") || normalizedID.contains("wechat")
-  }
-
-  private func fetchSelectableInputSources() -> [InputSource] {
-    guard let list = TISCreateInputSourceList(nil, false)?.takeRetainedValue() as? [TISInputSource] else {
-      return []
-    }
-
-    var sources: [InputSource] = []
-    sources.reserveCapacity(list.count)
-    for source in list {
-      guard boolProperty(source, kTISPropertyInputSourceIsSelectCapable) else { continue }
-      guard boolProperty(source, kTISPropertyInputSourceIsEnabled) else { continue }
-      guard let id = stringProperty(source, kTISPropertyInputSourceID) else { continue }
-      guard let name = stringProperty(source, kTISPropertyLocalizedName) else { continue }
-
-      sources.append(InputSource(id: id, name: name))
-    }
-
-    // 稳定排序：先按名称，再按 id
-    sources.sort { lhs, rhs in
-      if lhs.name == rhs.name { return lhs.id < rhs.id }
-      return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
-    }
-    return sources
-  }
-
-  private func anyProperty(_ source: TISInputSource, _ key: CFString) -> AnyObject? {
-    guard let ptr = TISGetInputSourceProperty(source, key) else { return nil }
-    return Unmanaged<AnyObject>.fromOpaque(ptr).takeUnretainedValue()
-  }
-
-  private func stringProperty(_ source: TISInputSource, _ key: CFString) -> String? {
-    anyProperty(source, key) as? String
-  }
-
-  private func boolProperty(_ source: TISInputSource, _ key: CFString) -> Bool {
-    guard let value = anyProperty(source, key) else { return false }
-    if CFGetTypeID(value) == CFBooleanGetTypeID(), let bool = value as? Bool {
-      return bool
-    }
-    if let number = value as? NSNumber { return number.boolValue }
-    return false
   }
 
   private func notifyStateChanged() {

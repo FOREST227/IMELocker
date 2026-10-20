@@ -5,6 +5,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   private let launchAtLoginService = LaunchAtLoginService()
   private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
   private let menu = NSMenu()
+  private let updateChecker = UpdateChecker()
+  private var displayedLockStatus: LockStatus?
   private let menuBuilder = StatusMenuBuilder()
   private lazy var menuActions = StatusMenuActionHandlers(
     target: self,
@@ -18,6 +20,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
   func applicationDidFinishLaunching(_ notification: Notification) {
     menu.delegate = self
+    menu.autoenablesItems = false
     statusItem.menu = menu
 
     lockService.addStateChangeHandler { [weak self] in
@@ -43,7 +46,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
   private func updateStatusButton(using state: AppViewState) {
     guard let button = statusItem.button else { return }
-    button.image = makeStatusImage(enabled: state.isLockEnabled)
+    button.toolTip = state.lockStatusText
+    button.setAccessibilityLabel(state.lockStatusText)
+    guard displayedLockStatus != state.lockStatus else { return }
+    displayedLockStatus = state.lockStatus
+    button.image = makeStatusImage(enabled: state.lockStatus == .locked)
     button.imagePosition = .imageOnly
     // 不设置 contentTintColor，由系统根据菜单栏外观自动着色（暗色=白，亮色=黑）
   }
@@ -93,96 +100,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
       return
     }
 
-    do {
-      try launchNewInstance(at: bundleURL)
-      NSApplication.shared.terminate(nil)
-    } catch {
-      AlertPresenter.show(title: "无法重启应用", message: "启动新实例失败：\(error.localizedDescription)")
+    let configuration = NSWorkspace.OpenConfiguration()
+    configuration.createsNewApplicationInstance = true
+    NSWorkspace.shared.openApplication(at: bundleURL, configuration: configuration) { application, error in
+      DispatchQueue.main.async {
+        if application != nil, error == nil {
+          NSApplication.shared.terminate(nil)
+        } else {
+          AlertPresenter.show(title: "无法重启应用", message: "启动新实例失败：\(error?.localizedDescription ?? "未能启动应用")")
+        }
+      }
     }
   }
 
   @objc private func about() {
-    let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0.1"
-    let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "1"
-
-    let latestVersion = fetchLatestVersion()
-    let hasUpdate = latestVersion.map { $0 != version } ?? false
-
+    let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0.4"
+    let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "4"
     let alert = NSAlert()
     alert.messageText = AppConstants.displayName
-
-    // 版本信息 + 红点提示
-    let versionLine = NSMutableAttributedString()
-    versionLine.append(NSAttributedString(
-      string: "版本 \(version) (\(build))",
-      attributes: [.foregroundColor: NSColor.labelColor]
-    ))
-    if hasUpdate {
-      versionLine.append(NSAttributedString(
-        string: " ●",
-        attributes: [.foregroundColor: NSColor.systemRed]
-      ))
-      versionLine.append(NSAttributedString(
-        string: " 有新版本 \(latestVersion!)",
-        attributes: [.foregroundColor: NSColor.secondaryLabelColor, .font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize, weight: .light)]
-      ))
-    }
-    alert.informativeText = " "
-    alert.accessoryView = makeAboutAccessoryView(versionLine: versionLine)
-
-    // 按钮：有更新时高亮
-    if hasUpdate {
-      alert.addButton(withTitle: "查看更新 (\(latestVersion!))")
-    } else {
-      alert.addButton(withTitle: "查看更新")
-    }
+    alert.informativeText = "版本 \(version) (\(build))\n轻量 macOS 菜单栏工具，将输入法锁定到指定目标。"
+    let updateLabel = NSTextField(wrappingLabelWithString: "正在检查更新…")
+    updateLabel.frame = NSRect(x: 0, y: 0, width: 280, height: 36)
+    updateLabel.font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
+    updateLabel.textColor = .secondaryLabelColor
+    alert.accessoryView = updateLabel
+    alert.addButton(withTitle: "查看更新")
     alert.addButton(withTitle: "好")
 
+    updateChecker.check { [weak alert, weak updateLabel] latest in
+      guard let alert, let updateLabel else { return }
+      guard let latest else {
+        updateLabel.stringValue = "暂时无法检查更新，可点击“查看更新”访问发布页。"
+        return
+      }
+      if ReleaseVersion.isNewer(latest, than: version) {
+        updateLabel.stringValue = "● 有新版本 \(latest)"
+        updateLabel.textColor = .systemRed
+        alert.buttons.first?.title = "查看更新 (\(latest))"
+      } else {
+        updateLabel.stringValue = "当前已是最新版本"
+      }
+    }
     NSApp.activate(ignoringOtherApps: true)
-    let response = alert.runModal()
-    if response == .alertFirstButtonReturn {
+    if alert.runModal() == .alertFirstButtonReturn {
       NSWorkspace.shared.open(URL(string: "https://github.com/Forest227/IMELocker/releases/latest")!)
     }
-  }
-
-  private func makeAboutAccessoryView(versionLine: NSAttributedString) -> NSView {
-    let container = NSView(frame: NSRect(x: 0, y: 0, width: 260, height: 60))
-
-    let versionLabel = NSTextField(labelWithAttributedString: versionLine)
-    versionLabel.frame = NSRect(x: 0, y: 30, width: 260, height: 20)
-
-    let descLabel = NSTextField(labelWithString: "轻量 macOS 菜单栏工具，将输入法锁定到指定目标，防止应用偷偷切换。")
-    descLabel.frame = NSRect(x: 0, y: 0, width: 260, height: 30)
-    descLabel.font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
-    descLabel.textColor = .secondaryLabelColor
-    descLabel.maximumNumberOfLines = 2
-    descLabel.lineBreakMode = .byWordWrapping
-
-    container.addSubview(versionLabel)
-    container.addSubview(descLabel)
-    return container
-  }
-
-  /// 从 GitHub API 获取最新 release 版本号，超时 3 秒
-  private func fetchLatestVersion() -> String? {
-    let semaphore = DispatchSemaphore(value: 0)
-    var result: String?
-
-    var request = URLRequest(url: URL(string: "https://api.github.com/repos/Forest227/IMELocker/releases/latest")!)
-    request.timeoutInterval = 3
-    request.setValue("application/vnd.github.v3+json", forHTTPHeaderField: "Accept")
-
-    URLSession.shared.dataTask(with: request) { data, _, _ in
-      defer { semaphore.signal() }
-      guard let data,
-            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-            let tagName = json["tag_name"] as? String
-      else { return }
-      result = tagName.hasPrefix("v") ? String(tagName.dropFirst()) : tagName
-    }.resume()
-
-    _ = semaphore.wait(timeout: .now() + 3)
-    return result
   }
 
   @objc private func quit() {
@@ -200,14 +162,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
       parentDirectoryURL.appendingPathComponent("\(AppConstants.legacyDisplayName).app"),
     ]
 
-    return candidateURLs.first(where: { fileManager.fileExists(atPath: $0.path) })
-  }
-
-  private func launchNewInstance(at bundleURL: URL) throws {
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-    process.arguments = ["-n", bundleURL.path]
-    try process.run()
+    return candidateURLs.first { url in
+      url.pathExtension == "app" && fileManager.fileExists(atPath: url.path)
+        && Bundle(url: url)?.executableURL.map { fileManager.isExecutableFile(atPath: $0.path) } == true
+    }
   }
 }
 
@@ -278,6 +236,7 @@ struct AppViewState {
   let currentInputSourceName: String
   let isSecureInputEnabled: Bool
   let isLockEnabled: Bool
+  let lockStatus: LockStatus
   let selectableInputSources: [InputSource]
   let targetInputSourceID: String?
   let targetInputSourceName: String?
@@ -290,6 +249,7 @@ struct AppViewState {
     currentInputSourceName = lockService.currentInputSource()?.name ?? AppConstants.unknownInputSourceName
     isSecureInputEnabled = lockService.isSecureInputEnabled
     isLockEnabled = lockService.isEnabled
+    lockStatus = lockService.lockStatus
     selectableInputSources = availableInputSources
     targetInputSourceID = selectedTargetInputSourceID
     targetInputSourceName = availableInputSources
@@ -299,7 +259,7 @@ struct AppViewState {
   }
 
   var lockStatusText: String {
-    isLockEnabled ? "输入法已锁定" : "输入法已解锁"
+    lockStatus.description
   }
 
   var currentInputSourceText: String {
@@ -359,7 +319,7 @@ final class StatusMenuBuilder {
     menu.removeAllItems()
 
     // ── 区域 1：锁定状态标题 ──
-    let statusIcon = state.isLockEnabled
+    let statusIcon = state.lockStatus == .locked
       ? SFSymbol.image(SFSymbol.statusLockEnabled, description: "已锁定")
       : SFSymbol.image(SFSymbol.statusLockDisabled, description: "未锁定")
     addBoldItem(title: state.lockStatusText, image: statusIcon, to: menu)
@@ -390,6 +350,7 @@ final class StatusMenuBuilder {
     )
     launchItem.state = state.launchAtLoginControlState
     launchItem.isEnabled = state.isLaunchAtLoginToggleEnabled
+    launchItem.toolTip = state.launchAtLoginStatusText
     menu.addItem(launchItem)
 
     if state.shouldShowOpenLoginItemsSettings {

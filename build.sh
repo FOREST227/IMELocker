@@ -1,132 +1,81 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ── 参数解析 ──
-# 用法: ./build.sh [--target universal|arm64|x86_64]
-TARGET="${1:---target}"
-TARGET_VALUE="${2:-universal}"
-
-if [[ "${TARGET}" == "--target" ]]; then
-  :
-else
-  echo "用法: ./build.sh [--target universal|arm64|x86_64]" >&2
-  exit 1
+# ./build.sh [--target universal|arm64|x86_64|all]
+TARGET_VALUE=universal
+if [[ $# -gt 0 ]]; then
+  if [[ $# -ne 2 || "$1" != --target ]]; then
+    echo '用法: ./build.sh [--target universal|arm64|x86_64|all]' >&2
+    exit 1
+  fi
+  TARGET_VALUE="$2"
 fi
+case "${TARGET_VALUE}" in
+  universal|arm64|x86_64|all) ;;
+  *) echo "error: unsupported target: ${TARGET_VALUE}" >&2; exit 1 ;;
+esac
 
-# ── 配置 ──
-APP_EXEC_NAME="InputSourceLock"
-APP_BUNDLE_NAME="输入法锁定"
-MIN_MACOS_VERSION="12.0"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${ROOT_DIR}/build"
-APP_DIR="${BUILD_DIR}/${APP_BUNDLE_NAME}.app"
-LEGACY_APP_DIRS=("${BUILD_DIR}/WeChatIMLock.app" "${BUILD_DIR}/微信输入法锁定.app")
-MODULE_CACHE_DIR="${BUILD_DIR}/ModuleCache"
 BIN_DIR="${BUILD_DIR}/bin"
-
-rm -rf "${APP_DIR}" "${LEGACY_APP_DIRS[@]}"
-mkdir -p "${APP_DIR}/Contents/MacOS"
-mkdir -p "${APP_DIR}/Contents/Resources"
-mkdir -p "${APP_DIR}/Contents/Frameworks"
-mkdir -p "${MODULE_CACHE_DIR}/arm64" "${MODULE_CACHE_DIR}/x86_64"
-mkdir -p "${BIN_DIR}"
-
-cp "${ROOT_DIR}/Resources/Info.plist" "${APP_DIR}/Contents/Info.plist"
-
-if [[ -f "${ROOT_DIR}/Resources/AppIcon.icns" ]]; then
-  cp "${ROOT_DIR}/Resources/AppIcon.icns" "${APP_DIR}/Contents/Resources/AppIcon.icns"
-fi
-
+MODULE_CACHE_DIR="${BUILD_DIR}/ModuleCache"
+APP_BUNDLE_NAME="输入法锁定"
+APP_EXEC_NAME="InputSourceLock"
 SDK_PATH="$(xcrun --sdk macosx --show-sdk-path)"
-OUT_BIN="${APP_DIR}/Contents/MacOS/${APP_EXEC_NAME}"
-ARM_BIN="${BIN_DIR}/${APP_EXEC_NAME}-arm64"
-X86_BIN="${BIN_DIR}/${APP_EXEC_NAME}-x86_64"
+mkdir -p "${BIN_DIR}" "${MODULE_CACHE_DIR}/arm64" "${MODULE_CACHE_DIR}/x86_64"
 SWIFT_SOURCES=("${ROOT_DIR}"/src/*.swift)
 
-COMMON_ARGS=(
-  -O
-  -sdk "${SDK_PATH}"
-  -framework Cocoa
-  -framework Carbon
-  -framework ServiceManagement
-)
-
-# ── 编译函数 ──
-build_arm64() {
-  swiftc \
-    "${COMMON_ARGS[@]}" \
-    -module-cache-path "${MODULE_CACHE_DIR}/arm64" \
-    -target "arm64-apple-macosx${MIN_MACOS_VERSION}" \
-    -o "${ARM_BIN}" \
-    "${SWIFT_SOURCES[@]}"
+compile() {
+  local arch="$1"
+  swiftc -O -sdk "${SDK_PATH}" \
+    -framework Cocoa -framework Carbon -framework ServiceManagement \
+    -module-cache-path "${MODULE_CACHE_DIR}/${arch}" \
+    -target "${arch}-apple-macosx12.0" \
+    -o "${BIN_DIR}/${APP_EXEC_NAME}-${arch}" "${SWIFT_SOURCES[@]}"
 }
 
-build_x86_64() {
-  swiftc \
-    "${COMMON_ARGS[@]}" \
-    -module-cache-path "${MODULE_CACHE_DIR}/x86_64" \
-    -target "x86_64-apple-macosx${MIN_MACOS_VERSION}" \
-    -o "${X86_BIN}" \
-    "${SWIFT_SOURCES[@]}"
-}
-
-# ── 根据 target 执行编译 ──
 case "${TARGET_VALUE}" in
-  arm64)
-    build_arm64
-    cp "${ARM_BIN}" "${OUT_BIN}"
-    ;;
-  x86_64)
-    build_x86_64
-    cp "${X86_BIN}" "${OUT_BIN}"
-    ;;
-  universal|*)
-    # 并行编译
-    build_arm64 &
+  arm64|x86_64) compile "${TARGET_VALUE}" ;;
+  universal|all)
+    compile arm64 &
     ARM_PID=$!
-
-    X86_OK=true
-    build_x86_64 &
+    compile x86_64 &
     X86_PID=$!
-
-    if ! wait "${ARM_PID}"; then
-      echo "error: arm64 build failed" >&2
+    BUILD_FAILED=0
+    wait "${ARM_PID}" || BUILD_FAILED=1
+    wait "${X86_PID}" || BUILD_FAILED=1
+    if [[ "${BUILD_FAILED}" -ne 0 ]]; then
+      echo 'error: Both arm64 and x86_64 are required. Check the selected Xcode/toolchain; no universal package was produced.' >&2
       exit 1
     fi
-
-    if ! wait "${X86_PID}"; then
-      echo "warn: x86_64 build failed; output arm64-only binary" >&2
-      X86_OK=false
-    fi
-
-    if [[ "${X86_OK}" == true ]]; then
-      lipo -create -output "${OUT_BIN}" "${ARM_BIN}" "${X86_BIN}"
-    else
-      cp "${ARM_BIN}" "${OUT_BIN}"
-    fi
+    lipo -create -output "${BIN_DIR}/${APP_EXEC_NAME}-universal" \
+      "${BIN_DIR}/${APP_EXEC_NAME}-arm64" "${BIN_DIR}/${APP_EXEC_NAME}-x86_64"
     ;;
 esac
 
-# ── 后处理：复制 Swift 运行时 ──
-if STD_TOOL="$(xcrun --find swift-stdlib-tool 2>/dev/null)"; then
-  "${STD_TOOL}" \
-    --copy \
-    --scan-executable "${OUT_BIN}" \
-    --destination "${APP_DIR}/Contents/Frameworks" \
-    --platform macosx \
-    --strip-bitcode >/dev/null 2>&1 || true
-fi
-
-# ── 签名：先签 Frameworks，再签主二进制 ──
-if command -v codesign >/dev/null 2>&1; then
-  # 签名 Frameworks 下的每个 dylib
-  if [[ -d "${APP_DIR}/Contents/Frameworks" ]]; then
-    find "${APP_DIR}/Contents/Frameworks" -name "*.dylib" -o -name "*.framework" | while read -r lib; do
-      codesign --force --sign - "${lib}" >/dev/null 2>&1 || true
-    done
+make_bundle() {
+  local arch="$1" app_dir="$2"
+  rm -rf "${app_dir}"
+  mkdir -p "${app_dir}/Contents/MacOS" "${app_dir}/Contents/Resources" "${app_dir}/Contents/Frameworks"
+  cp "${ROOT_DIR}/Resources/Info.plist" "${app_dir}/Contents/Info.plist"
+  cp "${ROOT_DIR}/Resources/AppIcon.icns" "${app_dir}/Contents/Resources/AppIcon.icns"
+  cp "${BIN_DIR}/${APP_EXEC_NAME}-${arch}" "${app_dir}/Contents/MacOS/${APP_EXEC_NAME}"
+  if STD_TOOL="$(xcrun --find swift-stdlib-tool 2>/dev/null)"; then
+    "${STD_TOOL}" --copy --scan-executable "${app_dir}/Contents/MacOS/${APP_EXEC_NAME}" \
+      --destination "${app_dir}/Contents/Frameworks" --platform macosx --strip-bitcode
   fi
-  # 签名主 app bundle
-  codesign --force --sign - "${APP_DIR}" >/dev/null 2>&1 || true
-fi
+  while IFS= read -r -d '' lib; do
+    codesign --force --sign - "${lib}"
+  done < <(find "${app_dir}/Contents/Frameworks" \( -name '*.dylib' -o -name '*.framework' \) -print0)
+  codesign --force --sign - "${app_dir}"
+  bash "${ROOT_DIR}/scripts/verify_app.sh" "${app_dir}" "${arch}"
+  echo "Built: ${app_dir} (${arch})"
+}
 
-echo "Built: ${APP_DIR} (${TARGET_VALUE})"
+if [[ "${TARGET_VALUE}" == all ]]; then
+  for arch in arm64 x86_64 universal; do
+    make_bundle "${arch}" "${BUILD_DIR}/${arch}/${APP_BUNDLE_NAME}.app"
+  done
+else
+  make_bundle "${TARGET_VALUE}" "${BUILD_DIR}/${APP_BUNDLE_NAME}.app"
+fi
