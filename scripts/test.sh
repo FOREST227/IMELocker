@@ -10,4 +10,5 @@ done
 swiftc -framework Cocoa -framework Carbon -framework ServiceManagement \
   "${SOURCES[@]}" "${ROOT_DIR}/tests/RegressionTests.swift" -o "${TEST_DIR}/regression-tests"
 "${TEST_DIR}/regression-tests"
+swift "${ROOT_DIR}/tests/IconTests.swift"
 python3 -m unittest discover -s "${ROOT_DIR}/tests" -p 'test_*.py'

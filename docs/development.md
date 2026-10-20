@@ -20,7 +20,7 @@
 
 ```bash
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
-  bash scripts/build_dmg.sh 0.0.4 universal
+  bash scripts/build_dmg.sh 0.0.5 universal
 ```
 
 此方式使用同一套 Xcode 中的编译器、SDK 和兼容库，并保留 macOS 12 的最低系统要求。
@@ -38,11 +38,11 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
 ```bash
 bash build.sh --target all
 for target in universal arm64 x86_64; do
-  bash scripts/build_dmg.sh 0.0.4 "$target" --skip-build
+  bash scripts/build_dmg.sh 0.0.5 "$target" --skip-build
 done
 ```
 
-其中 `0.0.4` 应与当前 `Info.plist` 版本保持一致。`--skip-build` 读取 `build/<架构>/输入法锁定.app`，仍会检查版本、架构和签名。
+其中 `0.0.5` 应与当前 `Info.plist` 版本保持一致。`--skip-build` 读取 `build/<架构>/输入法锁定.app`，仍会检查版本、架构和签名。
 
 ## 验证
 
@@ -66,3 +66,27 @@ bash scripts/test.sh
 
 如果当前处于 `Secure Input` 场景（密码输入框、系统授权窗口等），应用会暂停强制切换，避免反复抢输入法。
 
+
+## 重新生成应用图标
+
+图标由 `scripts/generate_icon.py` 中的 SVG 几何图形生成。使用 Node.js 的 `sharp` 直接渲染透明 SVG，再由 Python/Pillow 缩放并封装为 ICNS；Quick Look 缩略图会填充白色背景，不适用于此流程。
+
+首次准备图标工具（应用本身无需这些依赖）：
+
+```bash
+mkdir -p build
+python3 -m venv build/icon-venv
+build/icon-venv/bin/pip install Pillow
+npm install --prefix build/icon-tools sharp
+```
+
+重新生成并验证：
+
+```bash
+build/icon-venv/bin/python scripts/generate_icon.py
+swift tests/IconTests.swift
+```
+
+生成器同时更新 `Resources/AppIcon.icns` 和 README 使用的 `Resources/AppIcon.png`。圆角和透明留白直接保存在图像中，适用于使用传统 ICNS 的旧版 macOS。透明度回归检查已纳入 `scripts/test.sh`。
+
+图标包含 11 个 ICNS 变体，覆盖标准及 Retina 尺寸。16px、32px 使用单独绘制的简化版：减少键帽数量、加粗锁柄并去掉锁孔和投影，以提高小尺寸辨识度。
