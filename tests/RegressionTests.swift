@@ -5,7 +5,7 @@ private func expect(_ condition: @autoclosure () -> Bool, _ message: String) {
   if !condition() { fputs("FAIL: \(message)\n", stderr); exit(1) }
 }
 
-private final class FakeInputSystem: InputSourceSystem {
+final class FakeInputSystem: InputSourceSystem {
   var sources = [InputSource(id: "test.ime", name: "Test IME"), InputSource(id: "test.abc", name: "ABC")]
   var current = InputSource(id: "test.abc", name: "ABC")
   var secure = false
@@ -83,6 +83,7 @@ struct RegressionTests {
     let system = FakeInputSystem()
     let notifications = TestDistributedCenter()
     let service = InputSourceLockService(defaults: defaults, system: system, notificationCenter: notifications)
+    runMenuTests(lockService: service)
     expect(service.lockStatus == .noTarget, "empty preferences cannot report locked")
     service.targetInputSourceID = "test.ime"
     expect(service.lockStatus == .restoring, "different input source is not locked yet")

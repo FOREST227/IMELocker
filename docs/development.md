@@ -20,7 +20,7 @@
 
 ```bash
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
-  bash scripts/build_dmg.sh 0.0.5 universal
+  bash scripts/build_dmg.sh 0.0.6 universal
 ```
 
 此方式使用同一套 Xcode 中的编译器、SDK 和兼容库，并保留 macOS 12 的最低系统要求。
@@ -38,11 +38,11 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
 ```bash
 bash build.sh --target all
 for target in universal arm64 x86_64; do
-  bash scripts/build_dmg.sh 0.0.5 "$target" --skip-build
+  bash scripts/build_dmg.sh 0.0.6 "$target" --skip-build
 done
 ```
 
-其中 `0.0.5` 应与当前 `Info.plist` 版本保持一致。`--skip-build` 读取 `build/<架构>/输入法锁定.app`，仍会检查版本、架构和签名。
+其中 `0.0.6` 应与当前 `Info.plist` 版本保持一致。`--skip-build` 读取 `build/<架构>/输入法锁定.app`，仍会检查版本、架构和签名。
 
 ## 验证
 
