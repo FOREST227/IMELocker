@@ -1,4 +1,12 @@
+# Generated files and local caches
 .DS_Store
 build/
-
 __pycache__/
+
+# Local AI tooling and agent-only working documents
+/.codex/
+/.claude/
+/Claude-Code-Remote/
+/AGENTS.md
+/CLAUDE.md
+/docs/superpowers/
