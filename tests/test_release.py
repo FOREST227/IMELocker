@@ -39,24 +39,30 @@ esac
                                              RELEASE_TEST_LOG=str(log), RELEASE_TEST_MODE=mode,
                                              FAIL_UPLOAD=str(int(fail_upload))))
             calls = log.read_text() if log.exists() else ''
-            return result, calls
+            checksum_path = root / 'build/SHA256SUMS.txt'
+            checksums = checksum_path.read_text() if checksum_path.exists() else ''
+            return result, calls, checksums
 
     def test_published_release_is_never_overwritten(self):
-        result, calls = self.run_release('published')
+        result, calls, checksums = self.run_release('published')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn('upload', calls)
         self.assertNotIn('edit', calls)
         self.assertNotIn('delete', calls)
+        self.assertEqual(checksums, '')
 
     def test_failed_upload_stays_draft(self):
-        result, calls = self.run_release('draft', fail_upload=True)
+        result, calls, _ = self.run_release('draft', fail_upload=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('upload', calls)
         self.assertNotIn('edit', calls)
 
     def test_new_release_publishes_only_after_upload(self):
-        result, calls = self.run_release('missing')
+        result, calls, checksums = self.run_release('missing')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('--draft --verify-tag', calls)
+        self.assertIn('build/SHA256SUMS.txt', calls)
         self.assertLess(calls.index('upload'), calls.index('edit'))
         self.assertNotIn('delete', calls)
+        for arch in ('universal', 'x86_64', 'arm64'):
+            self.assertIn(f'IMELocker-v0.0.3-{arch}.dmg', checksums)

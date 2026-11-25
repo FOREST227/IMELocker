@@ -31,7 +31,7 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
 ./scripts/build_dmg.sh
 ```
 
-发布时以 `Resources/Info.plist` 为版本来源，Git tag 和打包参数必须与其一致。CI 仅编译两个架构各一次，再复用产物生成三个安装包；新发布先上传为草稿，全部上传成功后公开，重跑会跳过已公开的 release，不覆盖其附件。
+发布时以 `Resources/Info.plist` 为版本来源，Git tag 和打包参数必须与其一致。CI（`.github/workflows/ci.yml`）会在推送到 `main` 和 PR 时自动运行回归测试并构建 universal 包；发布流程（`.github/workflows/release.yml`）仅编译两个架构各一次，复用产物生成三个安装包与 `SHA256SUMS.txt`，先上传为草稿，全部上传成功后公开，重跑会跳过已公开的 release，不覆盖其附件。
 
 一次构建并打包全部架构：
 
@@ -50,21 +50,25 @@ done
 bash scripts/test.sh
 ```
 
-回归测试使用隔离的偏好设置、输入法系统替身和网络响应，不切换系统输入法。构建与发布测试在临时目录中模拟工具失败，覆盖缺失架构、签名失败、非法参数、版本不一致、编译复用，以及已公开版本保护和草稿上传失败。
+回归测试使用隔离的偏好设置、输入法系统替身、前台应用替身和网络响应，不切换系统输入法。覆盖版本比较、锁定状态机、分布式通知、休眠唤醒与锁屏解锁、闲置去重、退避保护、按应用暂停、单实例保护、旧配置迁移、菜单交互、图标透明度以及构建与发布脚本失败路径。
 
 本机可运行 `IMELOCKER_UI_TESTS=1 bash scripts/test.sh`，额外验证真实 `NSAlert` 模态循环中的异步更新；测试会短暂显示并自动关闭一个测试窗口。
 
-发布前仍应在 macOS 12 和 Intel 真机上检查菜单、输入法切换、密码框暂停恢复及登录启动行为。
+发布前仍应在 macOS 12 和 Intel 真机上检查菜单、输入法切换、密码框暂停恢复、应用例外及登录启动行为。
 
 ## 工作原理
 
 应用通过 macOS Carbon 框架的 TIS（Text Input Source）API 获取和切换输入法，在以下时机尝试恢复目标输入法：
 
-1. **系统通知** — 通过分布式通知中心监听 `kTISNotifySelectedKeyboardInputSourceChanged`，输入法被切换时立即响应
+1. **系统通知** — 通过分布式通知中心监听 `kTISNotifySelectedKeyboardInputSourceChanged` 与 `kTISNotifyEnabledKeyboardInputSourcesChanged`，输入法被切换时立即响应
 2. **应用切换** — 监听 `NSWorkspace.didActivateApplicationNotification`，前台应用变化时检查
-3. **周期性检查** — 每 5 秒检查一次，同时刷新输入法列表，兜底防止通知遗漏
+3. **休眠唤醒与解锁** — 监听 `didWakeNotification`、`screensDidWakeNotification` 和 `sessionDidBecomeActiveNotification`，唤醒或锁屏解锁后立即恢复
+4. **周期性兜底检查** — 每 5 秒轻量检查一次（闲置已锁定时跳过列表重查与冗余 UI 刷新；菜单打开时主动刷新列表）
 
-如果当前处于 `Secure Input` 场景（密码输入框、系统授权窗口等），应用会暂停强制切换，避免反复抢输入法。
+保护机制：
+- 当前处于 `Secure Input` 场景（密码框、系统授权窗口等）或前台应用位于例外列表时，暂停强制切换；
+- 若连续切换失败或短时间内被高频弹回，自动启用指数退避（最高 2 秒）避免争抢 CPU；
+- 启动时执行单实例保护（重启流程通过 `--relaunch` 放行），并自动迁移旧版 `com.example.InputSourceLock` 偏好设置。
 
 
 ## 重新生成应用图标

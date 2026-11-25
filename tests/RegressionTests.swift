@@ -10,15 +10,27 @@ final class FakeInputSystem: InputSourceSystem {
   var current = InputSource(id: "test.abc", name: "ABC")
   var secure = false
   var selections: [String] = []
+  var selectableListQueries = 0
+  var selectStatus: OSStatus = noErr
   var isSecureInputEnabled: Bool { secure }
-  func selectableInputSources() -> [InputSource] { sources }
+  func selectableInputSources() -> [InputSource] {
+    selectableListQueries += 1
+    return sources
+  }
   func currentInputSource() -> InputSource? { current }
   func selectInputSource(id: String) -> OSStatus? {
     guard let source = sources.first(where: { $0.id == id }) else { return nil }
     selections.append(id)
-    current = source
-    return noErr
+    if selectStatus == noErr {
+      current = source
+    }
+    return selectStatus
   }
+}
+
+final class FakeFrontmostAppProvider: FrontmostAppProvider {
+  var currentApp: RunningAppInfo? = RunningAppInfo(bundleIdentifier: "com.apple.Safari", localizedName: "Safari")
+  func frontmostApp() -> RunningAppInfo? { currentApp }
 }
 
 private func waitUntil(_ message: String, timeout: TimeInterval = 2, _ predicate: () -> Bool) {
@@ -34,11 +46,13 @@ private final class ReleaseProtocol: URLProtocol {
   static var status = 200
   static var payload = "{\"tag_name\":\"v0.0.4\"}"
   static var requests = 0
+  static var lastRequest: URLRequest?
   override class func canInit(with request: URLRequest) -> Bool { true }
   override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
   override func startLoading() {
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [self] in
       Self.requests += 1
+      Self.lastRequest = request
       let response = HTTPURLResponse(url: request.url!, statusCode: Self.status,
                                      httpVersion: nil, headerFields: nil)!
       client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
@@ -82,7 +96,15 @@ struct RegressionTests {
     defer { defaults.removePersistentDomain(forName: suite) }
     let system = FakeInputSystem()
     let notifications = TestDistributedCenter()
-    let service = InputSourceLockService(defaults: defaults, system: system, notificationCenter: notifications)
+    let workspaceNotifications = NotificationCenter()
+    let frontmostProvider = FakeFrontmostAppProvider()
+    let service = InputSourceLockService(
+      defaults: defaults,
+      system: system,
+      notificationCenter: notifications,
+      workspaceNotificationCenter: workspaceNotifications,
+      frontmostAppProvider: frontmostProvider
+    )
     runMenuTests(lockService: service)
     expect(service.lockStatus == .noTarget, "empty preferences cannot report locked")
     service.targetInputSourceID = "test.ime"
@@ -131,7 +153,123 @@ struct RegressionTests {
     waitUntil("periodic fallback resumes when secure input ends without a notification", timeout: 6) {
       system.current.id == "test.ime"
     }
+
+    system.current = InputSource(id: "test.abc", name: "ABC")
+    workspaceNotifications.post(name: NSWorkspace.didWakeNotification, object: nil)
+    waitUntil("system wake restores target immediately", timeout: 1) {
+      system.current.id == "test.ime"
+    }
+    system.current = InputSource(id: "test.abc", name: "ABC")
+    workspaceNotifications.post(name: NSWorkspace.sessionDidBecomeActiveNotification, object: nil)
+    waitUntil("session unlock restores target immediately", timeout: 1) {
+      system.current.id == "test.ime"
+    }
+
+    var stateCallbackCount = 0
+    let handlerID = service.addStateChangeHandler { stateCallbackCount += 1 }
+    let queriesBeforeIdle = system.selectableListQueries
+    service.enforceSync(reason: "idle-1")
+    service.enforceSync(reason: "idle-2")
+    expect(stateCallbackCount == 0, "idle enforce must not fire redundant state change notifications")
+    expect(system.selectableListQueries == queriesBeforeIdle, "idle enforce must reuse cached input sources")
+
     service.isEnabled = false
+    stateCallbackCount = 0
+    system.current = InputSource(id: "test.abc", name: "ABC")
+    service.lock(to: "test.ime", reason: "atomic-lock")
+    expect(system.current.id == "test.ime" && service.lockStatus == .locked, "atomic lock activates target")
+    expect(stateCallbackCount == 1, "atomic lock notifies observers once")
+    service.removeStateChangeHandler(handlerID)
+
+    system.selectStatus = OSStatus(-50)
+    system.current = InputSource(id: "test.abc", name: "ABC")
+    service.enforceSync(reason: "fail-1")
+    expect(service.currentEnforceDelay() >= 0.05, "first failure backs off enforce delay")
+    service.enforceSync(reason: "fail-2")
+    expect(service.currentEnforceDelay() >= 0.10, "consecutive failures increase backoff")
+    system.selectStatus = noErr
+    service.enforceSync(reason: "recover")
+    expect(system.current.id == "test.ime" && service.currentEnforceDelay() == 0.01, "recovery resets failure backoff")
+
+    for _ in 0..<5 {
+      system.current = InputSource(id: "test.abc", name: "ABC")
+      service.enforceSync(reason: "bounce")
+    }
+    expect(service.currentEnforceDelay() >= 0.05, "rapid bounce loop backs off enforce delay")
+    service.lock(to: "test.ime", reason: "reset-backoff")
+    expect(service.currentEnforceDelay() == 0.01, "explicit lock resets backoff")
+
+    let terminal = RunningAppInfo(bundleIdentifier: "com.apple.Terminal", localizedName: "Terminal")
+    let safari = RunningAppInfo(bundleIdentifier: "com.apple.Safari", localizedName: "Safari")
+    frontmostProvider.currentApp = terminal
+    service.lock(to: "test.ime", reason: "app-exclusion-setup")
+    service.setAppExcluded(true, app: terminal)
+    expect(service.lockStatus == .pausedForApp, "excluded frontmost app pauses lock")
+    expect(service.excludedApps() == [terminal], "excluded apps list retains display name")
+    system.current = InputSource(id: "test.abc", name: "ABC")
+    service.enforceSync(reason: "excluded-app-check")
+    expect(system.current.id == "test.abc", "excluded app must not force-switch input source")
+    frontmostProvider.currentApp = safari
+    workspaceNotifications.post(name: NSWorkspace.didActivateApplicationNotification, object: nil)
+    waitUntil("switching to non-excluded app resumes lock", timeout: 1) {
+      system.current.id == "test.ime"
+    }
+    frontmostProvider.currentApp = terminal
+    system.current = InputSource(id: "test.abc", name: "ABC")
+    service.removeExcludedApp(bundleIdentifier: terminal.bundleIdentifier)
+    expect(system.current.id == "test.ime" && service.lockStatus == .locked,
+           "removing exclusion immediately restores target")
+    service.setAppExcluded(true, app: terminal)
+    service.clearExcludedApps()
+    expect(service.excludedApps().isEmpty, "clearing exclusions empties list")
+
+    service.isEnabled = false
+    system.sources.append(InputSource(id: "test.new", name: "New IME"))
+    expect(service.refreshSelectableInputSources().contains { $0.id == "test.new" },
+           "menu open refresh picks up newly added sources even when unlocked")
+    system.sources.removeAll { $0.id == "test.new" }
+
+    expect(!SingleInstanceGuard.shouldExit(arguments: ["app"], bundleIdentifier: "com.forest227.IMELocker",
+                                           currentPID: 100, otherActivePIDs: { _ in [100] }),
+           "first instance must run")
+    expect(SingleInstanceGuard.shouldExit(arguments: ["app"], bundleIdentifier: "com.forest227.IMELocker",
+                                          currentPID: 100, otherActivePIDs: { _ in [99, 100] }),
+           "duplicate instance must exit")
+    expect(!SingleInstanceGuard.shouldExit(arguments: ["app", AppConstants.relaunchArgument],
+                                           bundleIdentifier: "com.forest227.IMELocker",
+                                           currentPID: 100, otherActivePIDs: { _ in [99, 100] }),
+           "relaunch instance must be allowed")
+
+    expect(StatusBarClickAction.resolve(eventType: .leftMouseUp, modifierFlags: []) == .openMenu,
+           "left click opens menu")
+    expect(StatusBarClickAction.resolve(eventType: .rightMouseUp, modifierFlags: []) == .toggleLock,
+           "right click toggles lock")
+    expect(StatusBarClickAction.resolve(eventType: .leftMouseUp, modifierFlags: .option) == .toggleLock,
+           "option-click toggles lock")
+    expect(StatusBarClickAction.resolve(eventType: .leftMouseUp, modifierFlags: .control) == .toggleLock,
+           "control-click toggles lock")
+    expect(SFSymbol.statusCandidates(for: .locked) != SFSymbol.statusCandidates(for: .disabled),
+           "locked and unlocked status icons differ")
+    expect(SFSymbol.statusCandidates(for: .pausedForApp) == SFSymbol.statusCandidates(for: .paused),
+           "paused states share pause status icon")
+    expect(SFSymbol.statusCandidates(for: .targetUnavailable) != SFSymbol.statusCandidates(for: .disabled),
+           "unavailable target shows warning status icon")
+
+    let migrationSuite = "IMELocker.migration.\(UUID().uuidString)"
+    let migrationDefaults = UserDefaults(suiteName: migrationSuite)!
+    defer { migrationDefaults.removePersistentDomain(forName: migrationSuite) }
+    InputSourceLockService.migrateLegacyDefaults(
+      from: ["enabled": false, "targetInputSourceID": "legacy.ime"],
+      to: migrationDefaults
+    )
+    expect(migrationDefaults.object(forKey: "enabled") as? Bool == false, "legacy enabled flag migrates")
+    expect(migrationDefaults.string(forKey: "targetInputSourceID") == "legacy.ime", "legacy target ID migrates")
+    InputSourceLockService.migrateLegacyDefaults(
+      from: ["enabled": true, "targetInputSourceID": "overwrite.ime"],
+      to: migrationDefaults
+    )
+    expect(migrationDefaults.string(forKey: "targetInputSourceID") == "legacy.ime",
+           "migration never overwrites existing preferences")
 
     let config = URLSessionConfiguration.ephemeral
     config.protocolClasses = [ReleaseProtocol.self]
@@ -148,6 +286,10 @@ struct RegressionTests {
     waitUntil("coalesced update results") { results.count == 2 }
     expect(results.allSatisfy { $0 == "0.0.4" }, "release tag normalization")
     expect(ReleaseProtocol.requests == 1, "concurrent checks share a request")
+    expect(ReleaseProtocol.lastRequest?.value(forHTTPHeaderField: "Accept") == "application/vnd.github+json",
+           "GitHub API Accept header set")
+    expect(ReleaseProtocol.lastRequest?.value(forHTTPHeaderField: "User-Agent")?.hasPrefix("IMELocker/") == true,
+           "GitHub API User-Agent header set")
     checker.check { results.append($0) }
     waitUntil("cached update result") { results.count == 3 }
     expect(ReleaseProtocol.requests == 1, "cached checks must not repeat network request")

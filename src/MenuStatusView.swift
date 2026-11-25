@@ -11,6 +11,7 @@ final class MenuStatusView: NSView {
     super.init(frame: NSRect(x: 0, y: 0, width: 300, height: 64))
     symbol.frame = NSRect(x: 16, y: 14, width: 16, height: 18)
     symbol.contentTintColor = .labelColor
+    symbol.imageScaling = .scaleProportionallyDown
     heading.frame = NSRect(x: 40, y: 12, width: 244, height: 22)
     heading.font = .systemFont(ofSize: 13, weight: .semibold)
     heading.textColor = .labelColor
@@ -30,11 +31,12 @@ final class MenuStatusView: NSView {
 
   func update(using state: AppViewState) {
     heading.stringValue = state.menuStatusTitle
-    detail.stringValue = "当前使用\(state.currentInputSourceName)"
+    detail.stringValue = "当前：\(state.currentInputSourceName)"
     detail.toolTip = detail.stringValue
     detail.setAccessibilityLabel(detail.stringValue)
-    symbol.image = SFSymbol.image(state.lockStatus == .locked
-      ? SFSymbol.statusLockEnabled : SFSymbol.statusLockDisabled)
+    let config = NSImage.SymbolConfiguration(pointSize: 14, weight: .medium)
+    symbol.image = SFSymbol.image(SFSymbol.statusCandidates(for: state.lockStatus))?
+      .withSymbolConfiguration(config)
     symbol.setAccessibilityElement(false)
   }
 }

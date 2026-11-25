@@ -1,6 +1,31 @@
 import Cocoa
 import Carbon
 
+struct RunningAppInfo: Equatable, Hashable {
+  let bundleIdentifier: String
+  let localizedName: String
+}
+
+/// Isolates frontmost application lookup for per-app exclusion policy and testing.
+protocol FrontmostAppProvider {
+  func frontmostApp() -> RunningAppInfo?
+}
+
+struct WorkspaceFrontmostAppProvider: FrontmostAppProvider {
+  func frontmostApp() -> RunningAppInfo? {
+    guard let app = NSWorkspace.shared.frontmostApplication,
+          let bundleID = app.bundleIdentifier,
+          !bundleID.isEmpty else {
+      return nil
+    }
+    if bundleID == Bundle.main.bundleIdentifier {
+      return nil
+    }
+    let name = (app.localizedName?.isEmpty == false) ? app.localizedName! : bundleID
+    return RunningAppInfo(bundleIdentifier: bundleID, localizedName: name)
+  }
+}
+
 /// Isolates system input-source operations from lock policy.
 protocol InputSourceSystem {
   var isSecureInputEnabled: Bool { get }

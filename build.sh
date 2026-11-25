@@ -56,17 +56,10 @@ esac
 make_bundle() {
   local arch="$1" app_dir="$2"
   rm -rf "${app_dir}"
-  mkdir -p "${app_dir}/Contents/MacOS" "${app_dir}/Contents/Resources" "${app_dir}/Contents/Frameworks"
+  mkdir -p "${app_dir}/Contents/MacOS" "${app_dir}/Contents/Resources"
   cp "${ROOT_DIR}/Resources/Info.plist" "${app_dir}/Contents/Info.plist"
   cp "${ROOT_DIR}/Resources/AppIcon.icns" "${app_dir}/Contents/Resources/AppIcon.icns"
   cp "${BIN_DIR}/${APP_EXEC_NAME}-${arch}" "${app_dir}/Contents/MacOS/${APP_EXEC_NAME}"
-  if STD_TOOL="$(xcrun --find swift-stdlib-tool 2>/dev/null)"; then
-    "${STD_TOOL}" --copy --scan-executable "${app_dir}/Contents/MacOS/${APP_EXEC_NAME}" \
-      --destination "${app_dir}/Contents/Frameworks" --platform macosx --strip-bitcode
-  fi
-  while IFS= read -r -d '' lib; do
-    codesign --force --sign - "${lib}"
-  done < <(find "${app_dir}/Contents/Frameworks" \( -name '*.dylib' -o -name '*.framework' \) -print0)
   codesign --force --sign - "${app_dir}"
   bash "${ROOT_DIR}/scripts/verify_app.sh" "${app_dir}" "${arch}"
   echo "Built: ${app_dir} (${arch})"

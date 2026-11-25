@@ -2,7 +2,13 @@ import Cocoa
 
 private final class MenuActionProbe: NSObject {
   var selectedID: String?
+  var toggledApp: RunningAppInfo?
+  var removedBundleID: String?
+  var clearedExclusions = false
   @objc func select(_ sender: NSMenuItem) { selectedID = sender.representedObject as? String }
+  @objc func toggleAppExclusion(_ sender: NSMenuItem) { toggledApp = sender.representedObject as? RunningAppInfo }
+  @objc func removeExcludedApp(_ sender: NSMenuItem) { removedBundleID = sender.representedObject as? String }
+  @objc func clearExcludedApps() { clearedExclusions = true }
   @objc func toggle(_ sender: NSMenuItem) {}
   @objc func settings() {}
   @objc func restart() {}
@@ -16,9 +22,18 @@ func runMenuTests(lockService: InputSourceLockService) {
   }
   NSApplication.shared.setActivationPolicy(.prohibited)
   let probe = MenuActionProbe()
-  let actions = StatusMenuActionHandlers(target: probe, selectTarget: #selector(MenuActionProbe.select(_:)),
-    toggleLaunchAtLogin: #selector(MenuActionProbe.toggle(_:)), openLoginItemsSettings: #selector(MenuActionProbe.settings),
-    restart: #selector(MenuActionProbe.restart), about: #selector(MenuActionProbe.about), quit: #selector(MenuActionProbe.quit))
+  let actions = StatusMenuActionHandlers(
+    target: probe,
+    selectTarget: #selector(MenuActionProbe.select(_:)),
+    toggleCurrentAppExclusion: #selector(MenuActionProbe.toggleAppExclusion(_:)),
+    removeExcludedApp: #selector(MenuActionProbe.removeExcludedApp(_:)),
+    clearExcludedApps: #selector(MenuActionProbe.clearExcludedApps),
+    toggleLaunchAtLogin: #selector(MenuActionProbe.toggle(_:)),
+    openLoginItemsSettings: #selector(MenuActionProbe.settings),
+    restart: #selector(MenuActionProbe.restart),
+    about: #selector(MenuActionProbe.about),
+    quit: #selector(MenuActionProbe.quit)
+  )
   for status: LaunchAtLoginStatus in [.enabled, .disabled, .requiresApproval, .unsupported] {
     let state = AppViewState(lockService: lockService, launchAtLoginStatus: status)
     let menu = NSMenu()
@@ -43,21 +58,31 @@ func runMenuTests(lockService: InputSourceLockService) {
   let defaults = UserDefaults(suiteName: suite)!
   defer { defaults.removePersistentDomain(forName: suite) }
   let system = FakeInputSystem()
+  let frontmost = FakeFrontmostAppProvider()
+  let terminal = RunningAppInfo(bundleIdentifier: "com.apple.Terminal", localizedName: "Terminal")
+  frontmost.currentApp = terminal
   let longName = String(repeating: "超长输入法名称", count: 10)
   system.sources[0] = InputSource(id: "test.ime", name: longName)
-  let service = InputSourceLockService(defaults: defaults, system: system)
+  let service = InputSourceLockService(defaults: defaults, system: system, frontmostAppProvider: frontmost)
   let builder = StatusMenuBuilder()
   var previews: [(String, AppViewState)] = []
-  for status: LockStatus in [.locked, .paused, .restoring, .targetUnavailable, .noTarget, .disabled] {
+  for status: LockStatus in [.locked, .paused, .pausedForApp, .restoring, .targetUnavailable, .noTarget, .disabled] {
+    service.clearExcludedApps()
     service.isEnabled = status != .disabled
     service.targetInputSourceID = status == .noTarget ? nil : (status == .targetUnavailable ? "missing" : "test.ime")
     system.secure = status == .paused
+    if status == .pausedForApp {
+      service.setAppExcluded(true, app: terminal)
+    }
     system.current = status == .restoring ? system.sources[1] : system.sources[0]
     let state = AppViewState(lockService: service, launchAtLoginStatus: .disabled)
     require(state.lockStatus == status, "state fixture")
     let menu = NSMenu()
     builder.rebuild(menu: menu, using: state, actions: actions)
     let source = menu.items.first { $0.representedObject as? String == "test.ime" }!
+    let expectedState: NSControl.StateValue =
+      (status == .locked || status == .paused || status == .pausedForApp || status == .restoring) ? .on : .off
+    require(source.state == expectedState, "unlocked or unmatched item must not appear checked")
     require(source.title.count < longName.count && source.toolTip == longName,
             "long source names stay compact with a full-name tooltip")
     require(source.accessibilityLabel() == longName, "accessibility keeps full source name")
@@ -65,6 +90,18 @@ func runMenuTests(lockService: InputSourceLockService) {
     probe.selectedID = nil
     menu.performActionForItem(at: menu.index(of: source))
     require(probe.selectedID == "test.ime", "native menu selection delivers the source ID")
+
+    let excludeItem = menu.items.first { $0.action == actions.toggleCurrentAppExclusion }!
+    require(excludeItem.state == (status == .pausedForApp ? .on : .off), "app exclusion toggle reflects current app")
+    let submenuItem = menu.items.first { $0.submenu != nil }
+    require((submenuItem != nil) == (status == .pausedForApp), "excluded apps submenu appears only when non-empty")
+    if let submenu = submenuItem?.submenu {
+      let removeItem = submenu.items.first { $0.action == actions.removeExcludedApp }!
+      probe.removedBundleID = nil
+      submenu.performActionForItem(at: submenu.index(of: removeItem))
+      require(probe.removedBundleID == terminal.bundleIdentifier, "submenu removes excluded bundle ID")
+    }
+
     let header = menu.items.first!.view as! MenuStatusView
     let labels = header.subviews.compactMap { $0 as? NSTextField }
     require(labels.allSatisfy { $0.isEnabled && $0.frame.maxX <= header.bounds.width }, "readable labels fit header")
@@ -72,6 +109,8 @@ func runMenuTests(lockService: InputSourceLockService) {
     service.isEnabled = false
     let updated = AppViewState(lockService: service, launchAtLoginStatus: .disabled)
     builder.updateInformation(menu: menu, using: updated)
+    require(source.state == .off, "unlocking clears active menu item state")
+    require(excludeItem.state == (status == .pausedForApp ? .on : .off), "open-menu update preserves app exclusion state")
     require(labels.first?.stringValue == updated.menuStatusTitle && menu.items.first?.title == updated.menuStatusTitle, "open-menu header refreshes")
     require(menu.items.contains { $0 === source }, "refresh preserves native action items")
     previews.append((state.menuStatusTitle, state))

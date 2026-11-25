@@ -12,6 +12,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   private lazy var menuActions = StatusMenuActionHandlers(
     target: self,
     selectTarget: #selector(selectTarget(_:)),
+    toggleCurrentAppExclusion: #selector(toggleCurrentAppExclusion(_:)),
+    removeExcludedApp: #selector(removeExcludedApp(_:)),
+    clearExcludedApps: #selector(clearExcludedApps),
     toggleLaunchAtLogin: #selector(toggleLaunchAtLogin(_:)),
     openLoginItemsSettings: #selector(openLoginItemsSettings),
     restart: #selector(restart),
@@ -22,23 +25,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   func applicationDidFinishLaunching(_ notification: Notification) {
     menu.delegate = self
     menu.autoenablesItems = false
-    statusItem.menu = menu
+
+    if let button = statusItem.button {
+      button.target = self
+      button.action = #selector(handleStatusBarButtonClick(_:))
+      button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+    }
 
     lockService.addStateChangeHandler { [weak self] in
       self?.handleLockStateChanged()
     }
 
     lockService.start()
-    updateStatusButton(using: currentState())
+    updateStatusButton(using: lockService.lockStatus)
   }
 
   func menuWillOpen(_ menu: NSMenu) {
     isMenuOpen = true
+    lockService.refreshSelectableInputSources()
     menuBuilder.rebuild(menu: menu, using: currentState(), actions: menuActions)
   }
 
   func menuDidClose(_ menu: NSMenu) {
     isMenuOpen = false
+    statusItem.menu = nil
   }
 
   private func currentState() -> AppViewState {
@@ -46,25 +56,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   }
 
   private func handleLockStateChanged() {
-    let state = currentState()
-    updateStatusButton(using: state)
-    if isMenuOpen { menuBuilder.updateInformation(menu: menu, using: state) }
+    updateStatusButton(using: lockService.lockStatus)
+    if isMenuOpen { menuBuilder.updateInformation(menu: menu, using: currentState()) }
   }
 
-  private func updateStatusButton(using state: AppViewState) {
+  private func updateStatusButton(using lockStatus: LockStatus) {
     guard let button = statusItem.button else { return }
-    button.toolTip = state.lockStatusText
-    button.setAccessibilityLabel(state.lockStatusText)
-    guard displayedLockStatus != state.lockStatus else { return }
-    displayedLockStatus = state.lockStatus
-    button.image = makeStatusImage(enabled: state.lockStatus == .locked)
+    guard displayedLockStatus != lockStatus else { return }
+    displayedLockStatus = lockStatus
+    button.toolTip = "\(lockStatus.description)\n左键打开菜单 · 右键快捷切换"
+    button.setAccessibilityLabel(lockStatus.description)
+    button.image = makeStatusImage(for: lockStatus)
     button.imagePosition = .imageOnly
     // 不设置 contentTintColor，由系统根据菜单栏外观自动着色（暗色=白，亮色=黑）
   }
 
-  private func makeStatusImage(enabled: Bool) -> NSImage? {
+  private func makeStatusImage(for status: LockStatus) -> NSImage? {
     let desc = AppConstants.statusImageAccessibilityDescription
-    let candidates = enabled ? SFSymbol.statusLockEnabled : SFSymbol.statusLockDisabled
+    let candidates = SFSymbol.statusCandidates(for: status)
     let config = NSImage.SymbolConfiguration(pointSize: 15, weight: .regular)
 
     if let symbol = SFSymbol.image(candidates, description: desc)?.withSymbolConfiguration(config) {
@@ -76,6 +85,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     return NSImage(named: NSImage.applicationIconName)
   }
 
+  @objc private func handleStatusBarButtonClick(_ sender: NSStatusBarButton) {
+    let event = NSApp.currentEvent
+    let action = StatusBarClickAction.resolve(
+      eventType: event?.type,
+      modifierFlags: event?.modifierFlags ?? []
+    )
+    switch action {
+    case .toggleLock:
+      toggleLockQuickly()
+    case .openMenu:
+      openStatusMenu()
+    }
+  }
+
+  private func openStatusMenu() {
+    statusItem.menu = menu
+    statusItem.button?.performClick(nil)
+    statusItem.menu = nil
+  }
+
+  private func toggleLockQuickly() {
+    if lockService.isEnabled {
+      lockService.isEnabled = false
+    } else if let targetID = lockService.targetInputSourceID {
+      lockService.lock(to: targetID, reason: "quickToggle")
+    } else {
+      openStatusMenu()
+    }
+  }
+
   @objc private func selectTarget(_ sender: NSMenuItem) {
     guard let id = sender.representedObject as? String else { return }
     if lockService.targetInputSourceID == id && lockService.isEnabled {
@@ -83,10 +122,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
       lockService.isEnabled = false
     } else {
       // 锁定到新目标
-      lockService.targetInputSourceID = id
-      lockService.isEnabled = true
-      lockService.enforceSync(reason: "selectTarget")
+      lockService.lock(to: id, reason: "selectTarget")
     }
+  }
+
+  @objc private func toggleCurrentAppExclusion(_ sender: NSMenuItem) {
+    guard let app = sender.representedObject as? RunningAppInfo else { return }
+    lockService.toggleExclusion(for: app)
+  }
+
+  @objc private func removeExcludedApp(_ sender: NSMenuItem) {
+    guard let bundleID = sender.representedObject as? String else { return }
+    lockService.removeExcludedApp(bundleIdentifier: bundleID)
+  }
+
+  @objc private func clearExcludedApps() {
+    lockService.clearExcludedApps()
   }
 
   @objc private func toggleLaunchAtLogin(_ sender: NSMenuItem) {
@@ -109,6 +160,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     let configuration = NSWorkspace.OpenConfiguration()
     configuration.createsNewApplicationInstance = true
+    configuration.arguments = [AppConstants.relaunchArgument]
     NSWorkspace.shared.openApplication(at: bundleURL, configuration: configuration) { application, error in
       DispatchQueue.main.async {
         if application != nil, error == nil {
@@ -121,8 +173,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   }
 
   @objc private func about() {
-    let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0.6"
-    let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "6"
+    let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "未知"
+    let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "0"
     let alert = NSAlert()
     alert.messageText = AppConstants.displayName
     alert.informativeText = "版本 \(version) (\(build))\n轻量 macOS 菜单栏工具，将输入法锁定到指定目标。"
@@ -144,13 +196,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateLabel.stringValue = "● 有新版本 \(latest)"
         updateLabel.textColor = .systemRed
         alert.buttons.first?.title = "查看更新 (\(latest))"
+        alert.layout()
       } else {
         updateLabel.stringValue = "当前已是最新版本"
       }
     }
     NSApp.activate(ignoringOtherApps: true)
     if alert.runModal() == .alertFirstButtonReturn {
-      NSWorkspace.shared.open(URL(string: "https://github.com/Forest227/IMELocker/releases/latest")!)
+      NSWorkspace.shared.open(AppConstants.latestReleasePageURL)
     }
   }
 
@@ -173,337 +226,5 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
       url.pathExtension == "app" && fileManager.fileExists(atPath: url.path)
         && Bundle(url: url)?.executableURL.map { fileManager.isExecutableFile(atPath: $0.path) } == true
     }
-  }
-}
-
-/// SF Symbol 降级加载器。
-/// 每个符号维护一条回退链：首选（SF Symbols 3+）→ 简化版 → 基础版（SF Symbols 1）。
-/// macOS 12+ 对应 SF Symbols 3，但早期 12.0 构建可能存在个别缺失，
-/// 因此所有链的最后一项均为 SF Symbols 1 就有的符号。
-enum SFSymbol {
-  // MARK: - 锁定图标（状态栏 + 菜单共用）
-
-  static let statusLockEnabled = ["lock.shield.fill", "lock.shield", "lock.fill", "lock"]
-  static let statusLockDisabled = ["lock.shield", "lock.open", "lock"]
-
-  // MARK: - 菜单操作
-
-  static let restart = ["arrow.clockwise", "arrow.2.circlepath"]
-  static let quit = ["xmark.circle", "xmark.square", "xmark"]
-  static let info = ["info.circle", "info"]
-  static let openExternal = ["arrow.up.right.square", "arrow.up.right", "arrow.right"]
-  static let launchAtLogin = ["power", "bolt"]
-
-  // MARK: - 安全状态
-
-  static let secureInput = ["lock.shield", "lock.shield.fill", "lock"]
-  static let secureInputBadge = ["lock.shield.fill", "lock.shield", "lock.fill", "lock"]
-
-  // MARK: - 输入法列表
-
-  static let inputSourceSelected = ["checkmark.circle.fill", "checkmark.circle", "checkmark"]
-  static let inputSourceUnselected = ["circle", "minus"]
-
-  // MARK: - 加载
-
-  /// 按优先级尝试加载 SF Symbol，返回第一个成功匹配的 NSImage。
-  /// 所有候选均失败时返回 nil（调用方自行兜底）。
-  static func image(_ candidates: [String], description: String? = nil) -> NSImage? {
-    for name in candidates {
-      if let img = NSImage(systemSymbolName: name, accessibilityDescription: description) {
-        return img
-      }
-    }
-    return nil
-  }
-}
-
-enum AppConstants {
-  static let displayName = "输入法锁定"
-  static let legacyDisplayName = "微信输入法锁定"
-  static let loggerSubsystem = "InputSourceLock"
-  static let statusImageAccessibilityDescription = "Input Source Lock"
-  static let unknownInputSourceName = "未知"
-  static let noSelectableInputSourcesText = "（未发现可选输入法）"
-}
-
-enum AlertPresenter {
-  static func show(title: String, message: String) {
-    NSApp.activate(ignoringOtherApps: true)
-
-    let alert = NSAlert()
-    alert.messageText = title
-    alert.informativeText = message
-    alert.addButton(withTitle: "好")
-    alert.runModal()
-  }
-}
-
-struct AppViewState {
-  let currentInputSourceName: String
-  let isSecureInputEnabled: Bool
-  let isLockEnabled: Bool
-  let lockStatus: LockStatus
-  let selectableInputSources: [InputSource]
-  let targetInputSourceID: String?
-  let targetInputSourceName: String?
-  let launchAtLoginStatus: LaunchAtLoginStatus
-
-  init(lockService: InputSourceLockService, launchAtLoginService: LaunchAtLoginService) {
-    self.init(lockService: lockService, launchAtLoginStatus: launchAtLoginService.status)
-  }
-
-  init(lockService: InputSourceLockService, launchAtLoginStatus: LaunchAtLoginStatus) {
-    let availableInputSources = lockService.selectableInputSources()
-    let selectedTargetInputSourceID = lockService.targetInputSourceID
-
-    currentInputSourceName = lockService.currentInputSource()?.name ?? AppConstants.unknownInputSourceName
-    isSecureInputEnabled = lockService.isSecureInputEnabled
-    isLockEnabled = lockService.isEnabled
-    lockStatus = lockService.lockStatus
-    selectableInputSources = availableInputSources
-    targetInputSourceID = selectedTargetInputSourceID
-    targetInputSourceName = availableInputSources
-      .first(where: { $0.id == selectedTargetInputSourceID })?
-      .name
-    self.launchAtLoginStatus = launchAtLoginStatus
-  }
-
-  var menuStatusTitle: String {
-    switch lockStatus {
-    case .locked: return "已锁定"
-    case .disabled: return "已解锁"
-    case .noTarget: return "请选择输入法"
-    case .targetUnavailable: return "目标输入法不可用"
-    case .paused: return "已暂停 · 安全输入"
-    case .restoring: return "正在恢复输入法"
-    }
-  }
-
-  var selectionHint: String {
-    if selectableInputSources.isEmpty { return "请先在系统设置中添加输入法" }
-    if lockStatus == .targetUnavailable { return "请选择其他输入法，或重新启用原目标" }
-    return isLockEnabled && targetInputSourceID != nil
-      ? "再次点击已选项可解锁" : "点击输入法即可锁定"
-  }
-
-  var launchAtLoginTitle: String {
-    switch launchAtLoginStatus {
-    case .requiresApproval: return "登录时启动 · 待批准"
-    case .unsupported: return "登录时启动 · 需要 macOS 13"
-    case .notFound: return "登录时启动 · 应用不可用"
-    case .enabled, .disabled: return "登录时启动"
-    }
-  }
-
-  var lockStatusText: String {
-    lockStatus.description
-  }
-
-  var currentInputSourceText: String {
-    "当前输入法：\(currentInputSourceName)"
-  }
-
-  var secureInputText: String {
-    if isSecureInputEnabled {
-      return "Secure Input 已开启"
-    }
-    return "Secure Input 未开启"
-  }
-
-  var targetInputSourceText: String {
-    if let targetInputSourceName {
-      return "目标输入法：\(targetInputSourceName)"
-    }
-    return "目标输入法：未选择"
-  }
-
-  var launchAtLoginStatusText: String {
-    "登录启动：\(launchAtLoginStatus.description)"
-  }
-
-  var launchAtLoginControlState: NSControl.StateValue {
-    switch launchAtLoginStatus {
-    case .enabled:
-      return .on
-    case .requiresApproval:
-      return .mixed
-    case .disabled, .notFound, .unsupported:
-      return .off
-    }
-  }
-
-  var isLaunchAtLoginToggleEnabled: Bool {
-    launchAtLoginStatus != .unsupported
-  }
-
-  var shouldShowOpenLoginItemsSettings: Bool {
-    launchAtLoginStatus == .requiresApproval
-  }
-}
-
-struct StatusMenuActionHandlers {
-  let target: AnyObject
-  let selectTarget: Selector
-  let toggleLaunchAtLogin: Selector
-  let openLoginItemsSettings: Selector
-  let restart: Selector
-  let about: Selector
-  let quit: Selector
-}
-
-final class StatusMenuBuilder {
-  func rebuild(menu: NSMenu, using state: AppViewState, actions: StatusMenuActionHandlers) {
-    menu.removeAllItems()
-
-    menu.autoenablesItems = false
-    menu.minimumWidth = 300
-    let header = NSMenuItem(title: state.menuStatusTitle, action: nil, keyEquivalent: "")
-    header.view = MenuStatusView(state: state)
-    menu.addItem(header)
-    menu.addItem(.separator())
-    addInformation(title: "输入法", isHeading: true, to: menu)
-    addInputSourceItems(
-      state.selectableInputSources,
-      selectedID: state.targetInputSourceID,
-      to: menu,
-      actions: actions
-    )
-    addInformation(title: state.selectionHint, identifier: "selectionHint", to: menu)
-
-    menu.addItem(.separator())
-
-    // ── 区域 3：快捷操作 ──
-    let launchItem = makeActionItem(
-      title: state.launchAtLoginTitle,
-      action: actions.toggleLaunchAtLogin,
-      image: nil,
-      target: actions.target
-    )
-    applyCircularSelection(to: launchItem)
-    launchItem.state = state.launchAtLoginControlState
-    launchItem.isEnabled = state.isLaunchAtLoginToggleEnabled
-    launchItem.toolTip = state.launchAtLoginStatusText
-    menu.addItem(launchItem)
-
-    if state.shouldShowOpenLoginItemsSettings {
-      menu.addItem(
-        makeActionItem(
-          title: "打开系统登录项设置…",
-          action: actions.openLoginItemsSettings,
-          image: SFSymbol.image(SFSymbol.openExternal, description: "打开设置"),
-          target: actions.target
-        )
-      )
-    }
-
-    menu.addItem(.separator())
-
-    // ── 区域 4：应用操作 ──
-    menu.addItem(
-      makeActionItem(
-        title: "重启应用",
-        action: actions.restart,
-        image: SFSymbol.image(SFSymbol.restart, description: "重启"),
-        target: actions.target
-      )
-    )
-    menu.addItem(
-      makeActionItem(
-        title: "关于「输入法锁定」",
-        action: actions.about,
-        image: SFSymbol.image(SFSymbol.info, description: "关于"),
-        target: actions.target
-      )
-    )
-
-    menu.addItem(.separator())
-
-    menu.addItem(
-      makeActionItem(
-        title: "退出",
-        action: actions.quit,
-        keyEquivalent: "q",
-        image: SFSymbol.image(SFSymbol.quit, description: "退出"),
-        target: actions.target
-      )
-    )
-  }
-
-  private func addInputSourceItems(
-    _ sources: [InputSource],
-    selectedID: String?,
-    to menu: NSMenu,
-    actions: StatusMenuActionHandlers
-  ) {
-    guard !sources.isEmpty else {
-      addInformation(title: AppConstants.noSelectableInputSourcesText, to: menu)
-      return
-    }
-
-    for source in sources {
-      let isSelected = source.id == selectedID
-      let item = makeActionItem(
-        title: abbreviatedSourceName(source.name),
-        action: actions.selectTarget,
-        image: nil,
-        target: actions.target
-      )
-      applyCircularSelection(to: item)
-      item.toolTip = source.name
-      item.setAccessibilityLabel(source.name)
-      item.representedObject = source.id
-      item.state = isSelected ? .on : .off
-      menu.addItem(item)
-    }
-  }
-
-  /// Use the native state column for one circular indicator, preserving menu
-  /// selection semantics and accessibility without a second decorative icon.
-  private func applyCircularSelection(to item: NSMenuItem) {
-    item.onStateImage = SFSymbol.image(SFSymbol.inputSourceSelected, description: "已选中")
-    item.offStateImage = SFSymbol.image(SFSymbol.inputSourceUnselected, description: "未选中")
-    item.mixedStateImage = SFSymbol.image(["minus.circle.fill", "minus.circle"], description: "等待批准")
-  }
-
-  func updateInformation(menu: NSMenu, using state: AppViewState) {
-    menu.items.first?.title = state.menuStatusTitle
-    (menu.items.first?.view as? MenuStatusView)?.update(using: state)
-    if let hint = menu.items.first(where: { $0.identifier?.rawValue == "selectionHint" }) {
-      hint.title = state.selectionHint
-      (hint.view as? MenuInformationView)?.update(text: state.selectionHint)
-    }
-  }
-
-  private func addInformation(title: String, isHeading: Bool = false,
-                              identifier: String? = nil, to menu: NSMenu) {
-    let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-    item.view = MenuInformationView(text: title, isHeading: isHeading)
-    if let identifier { item.identifier = NSUserInterfaceItemIdentifier(identifier) }
-    menu.addItem(item)
-  }
-
-  private func abbreviatedSourceName(_ name: String) -> String {
-    let attributes: [NSAttributedString.Key: Any] = [.font: NSFont.menuFont(ofSize: 14)]
-    guard (name as NSString).size(withAttributes: attributes).width > 236 else { return name }
-    var prefix = name
-    while !prefix.isEmpty && ((prefix + "…") as NSString).size(withAttributes: attributes).width > 236 {
-      prefix.removeLast()
-    }
-    return prefix + "…"
-  }
-
-  /// 可点击操作项
-  private func makeActionItem(
-    title: String,
-    action: Selector,
-    keyEquivalent: String = "",
-    image: NSImage? = nil,
-    target: AnyObject
-  ) -> NSMenuItem {
-    let item = NSMenuItem(title: title, action: action, keyEquivalent: keyEquivalent)
-    item.target = target
-    if let image { item.image = image }
-    return item
   }
 }

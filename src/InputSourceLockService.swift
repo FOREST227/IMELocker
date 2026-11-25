@@ -11,44 +11,70 @@ final class InputSourceLockService {
   private enum Timing {
     static let enforceDelay: TimeInterval = 0.01
     static let periodicCheckInterval: TimeInterval = 5.0
+    static let periodicCheckTolerance: TimeInterval = 0.5
+    static let rapidSwitchWindow: TimeInterval = 2.5
+    static let maxRapidSwitchesBeforeBackoff = 4
+    static let backoffBaseDelay: TimeInterval = 0.05
+    static let maxBackoffDelay: TimeInterval = 2.0
+  }
+
+  private struct ObservedState: Equatable {
+    let isEnabled: Bool
+    let targetInputSourceID: String?
+    let lockStatus: LockStatus
+    let currentInputSourceID: String?
+    let currentInputSourceName: String?
   }
 
   private let log = Logger(subsystem: AppConstants.loggerSubsystem, category: "InputSourceLockService")
   private let defaults: UserDefaults
   private let system: InputSourceSystem
   private let systemNotificationCenter: DistributedNotificationCenter
-  private let workspaceNotificationCenter = NSWorkspace.shared.notificationCenter
+  private let workspaceNotificationCenter: NotificationCenter
+  private let frontmostAppProvider: FrontmostAppProvider
   private var enforceWorkItem: DispatchWorkItem?
   private var periodicCheckTimer: Timer?
   private var hasStarted = false
 
-  private let handlerQueue = DispatchQueue(label: "com.inputsourcelock.handlers")
+  private let handlerQueue = DispatchQueue(label: "com.forest227.IMELocker.handlers")
   private var stateChangeHandlers: [UUID: () -> Void] = [:]
+  private var lastNotifiedState: ObservedState?
 
-  // 输入法列表缓存，在 kTISNotifyEnabledKeyboardInputSourcesChanged 时失效
+  private var consecutiveEnforceFailures = 0
+  private var rapidSwitchCount = 0
+  private var lastSwitchAttemptDate: Date?
+
+  // 输入法列表缓存，在 kTISNotifyEnabledKeyboardInputSourcesChanged、菜单打开或系统唤醒时失效
   private var cachedSelectableSources: [InputSource]?
 
   private enum DefaultsKey {
     static let enabled = "enabled"
     static let targetID = "targetInputSourceID"
+    static let excludedBundleIDs = "excludedBundleIDs"
+    static let excludedAppNames = "excludedAppNames"
   }
 
   init(
     defaults: UserDefaults = .standard,
     system: InputSourceSystem = CarbonInputSourceSystem(),
-    notificationCenter: DistributedNotificationCenter = .default()
+    notificationCenter: DistributedNotificationCenter = .default(),
+    workspaceNotificationCenter: NotificationCenter = NSWorkspace.shared.notificationCenter,
+    frontmostAppProvider: FrontmostAppProvider = WorkspaceFrontmostAppProvider()
   ) {
     self.defaults = defaults
     self.system = system
     self.systemNotificationCenter = notificationCenter
+    self.workspaceNotificationCenter = workspaceNotificationCenter
+    self.frontmostAppProvider = frontmostAppProvider
+    migrateLegacyDefaultsIfNeeded()
   }
 
   var lockStatus: LockStatus {
-    guard isEnabled else { return .disabled }
-    guard targetInputSourceID != nil else { return .noTarget }
-    guard targetInputSource() != nil else { return .targetUnavailable }
-    guard !isSecureInputEnabled else { return .paused }
-    return currentInputSource()?.id == targetInputSourceID ? .locked : .restoring
+    computeLockStatus(current: currentInputSource(), selectableSources: nil)
+  }
+
+  func lockStatus(current: InputSource?, selectableSources: [InputSource]) -> LockStatus {
+    computeLockStatus(current: current, selectableSources: selectableSources)
   }
 
   deinit {
@@ -73,6 +99,7 @@ final class InputSourceLockService {
     get { defaults.object(forKey: DefaultsKey.enabled) as? Bool ?? true }
     set {
       defaults.set(newValue, forKey: DefaultsKey.enabled)
+      resetEnforceBackoff()
       if newValue {
         if hasStarted { startPeriodicCheck() }
       } else {
@@ -80,7 +107,7 @@ final class InputSourceLockService {
         periodicCheckTimer?.invalidate()
         periodicCheckTimer = nil
       }
-      notifyStateChanged()
+      notifyStateChangedIfNeeded()
     }
   }
 
@@ -92,7 +119,8 @@ final class InputSourceLockService {
       } else {
         defaults.removeObject(forKey: DefaultsKey.targetID)
       }
-      notifyStateChanged()
+      resetEnforceBackoff()
+      notifyStateChangedIfNeeded()
     }
   }
 
@@ -108,6 +136,90 @@ final class InputSourceLockService {
     observeSystemNotifications()
     startPeriodicCheck()
     enforce(reason: "start")
+  }
+
+  func lock(to targetID: String, reason: String) {
+    defaults.set(targetID, forKey: DefaultsKey.targetID)
+    defaults.set(true, forKey: DefaultsKey.enabled)
+    resetEnforceBackoff()
+    if hasStarted { startPeriodicCheck() }
+    enforceNow(reason: reason)
+  }
+
+  @discardableResult
+  func refreshSelectableInputSources() -> [InputSource] {
+    cachedSelectableSources = nil
+    return selectableInputSources()
+  }
+
+  func frontmostApp() -> RunningAppInfo? {
+    frontmostAppProvider.frontmostApp()
+  }
+
+  var excludedBundleIdentifiers: Set<String> {
+    Set(defaults.stringArray(forKey: DefaultsKey.excludedBundleIDs) ?? [])
+  }
+
+  func excludedApps() -> [RunningAppInfo] {
+    let savedNames = defaults.dictionary(forKey: DefaultsKey.excludedAppNames) as? [String: String] ?? [:]
+    return excludedBundleIdentifiers
+      .map { bundleID in
+        RunningAppInfo(bundleIdentifier: bundleID, localizedName: savedNames[bundleID] ?? bundleID)
+      }
+      .sorted { lhs, rhs in
+        if lhs.localizedName == rhs.localizedName {
+          return lhs.bundleIdentifier < rhs.bundleIdentifier
+        }
+        return lhs.localizedName.localizedStandardCompare(rhs.localizedName) == .orderedAscending
+      }
+  }
+
+  func isAppExcluded(bundleIdentifier: String) -> Bool {
+    excludedBundleIdentifiers.contains(bundleIdentifier)
+  }
+
+  var isCurrentAppExcluded: Bool {
+    guard let app = frontmostAppProvider.frontmostApp() else { return false }
+    return isAppExcluded(bundleIdentifier: app.bundleIdentifier)
+  }
+
+  func setAppExcluded(_ excluded: Bool, app: RunningAppInfo) {
+    var ids = excludedBundleIdentifiers
+    var names = defaults.dictionary(forKey: DefaultsKey.excludedAppNames) as? [String: String] ?? [:]
+    if excluded {
+      ids.insert(app.bundleIdentifier)
+      names[app.bundleIdentifier] = app.localizedName
+    } else {
+      ids.remove(app.bundleIdentifier)
+      names.removeValue(forKey: app.bundleIdentifier)
+    }
+    defaults.set(Array(ids).sorted(), forKey: DefaultsKey.excludedBundleIDs)
+    defaults.set(names, forKey: DefaultsKey.excludedAppNames)
+    resetEnforceBackoff()
+    if !excluded && isEnabled {
+      enforceNow(reason: "appExclusionRemoved")
+    } else {
+      notifyStateChangedIfNeeded()
+    }
+  }
+
+  func toggleExclusion(for app: RunningAppInfo) {
+    setAppExcluded(!isAppExcluded(bundleIdentifier: app.bundleIdentifier), app: app)
+  }
+
+  func removeExcludedApp(bundleIdentifier: String) {
+    setAppExcluded(false, app: RunningAppInfo(bundleIdentifier: bundleIdentifier, localizedName: bundleIdentifier))
+  }
+
+  func clearExcludedApps() {
+    defaults.removeObject(forKey: DefaultsKey.excludedBundleIDs)
+    defaults.removeObject(forKey: DefaultsKey.excludedAppNames)
+    resetEnforceBackoff()
+    if isEnabled {
+      enforceNow(reason: "clearExcludedApps")
+    } else {
+      notifyStateChangedIfNeeded()
+    }
   }
 
   private func observeSystemNotifications() {
@@ -133,6 +245,24 @@ final class InputSourceLockService {
       name: NSWorkspace.didActivateApplicationNotification,
       object: nil
     )
+    workspaceNotificationCenter.addObserver(
+      self,
+      selector: #selector(systemDidWake(_:)),
+      name: NSWorkspace.didWakeNotification,
+      object: nil
+    )
+    workspaceNotificationCenter.addObserver(
+      self,
+      selector: #selector(systemDidWake(_:)),
+      name: NSWorkspace.screensDidWakeNotification,
+      object: nil
+    )
+    workspaceNotificationCenter.addObserver(
+      self,
+      selector: #selector(systemDidWake(_:)),
+      name: NSWorkspace.sessionDidBecomeActiveNotification,
+      object: nil
+    )
   }
 
   private func startPeriodicCheck() {
@@ -145,7 +275,7 @@ final class InputSourceLockService {
     ) { [weak self] _ in
       self?.handlePeriodicCheck()
     }
-    timer.tolerance = 0.2
+    timer.tolerance = Timing.periodicCheckTolerance
     RunLoop.main.add(timer, forMode: .common)
     periodicCheckTimer = timer
   }
@@ -174,32 +304,71 @@ final class InputSourceLockService {
     enforceNow(reason: reason)
   }
 
+  func currentEnforceDelay(now: Date = Date()) -> TimeInterval {
+    let effectiveRapidCount: Int
+    if let lastAttempt = lastSwitchAttemptDate,
+       now.timeIntervalSince(lastAttempt) < Timing.rapidSwitchWindow {
+      effectiveRapidCount = rapidSwitchCount
+    } else {
+      effectiveRapidCount = 0
+    }
+    let rapidExcess = max(0, effectiveRapidCount - Timing.maxRapidSwitchesBeforeBackoff)
+    let backoffSteps = max(consecutiveEnforceFailures, rapidExcess)
+    guard backoffSteps > 0 else { return Timing.enforceDelay }
+    let exponent = min(backoffSteps - 1, 10)
+    return min(Timing.backoffBaseDelay * Double(1 << exponent), Timing.maxBackoffDelay)
+  }
+
+  private func resetEnforceBackoff() {
+    consecutiveEnforceFailures = 0
+    rapidSwitchCount = 0
+    lastSwitchAttemptDate = nil
+  }
+
   private func scheduleEnforce(reason: String) {
     enforceWorkItem?.cancel()
+    let delay = currentEnforceDelay()
     let item = DispatchWorkItem { [weak self] in
       self?.enforceNow(reason: reason)
     }
     enforceWorkItem = item
-    DispatchQueue.main.asyncAfter(deadline: .now() + Timing.enforceDelay, execute: item)
+    DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
   }
 
   private func enforceNow(reason: String) {
-    defer { notifyStateChanged() }
+    defer { notifyStateChangedIfNeeded() }
     guard isEnabled else { return }
     guard !isSecureInputEnabled else { return }
+    guard !isCurrentAppExcluded else { return }
     guard let targetID = targetInputSourceID else { return }
 
     let current = currentInputSource()
-    if current?.id == targetID { return }
+    if current?.id == targetID {
+      consecutiveEnforceFailures = 0
+      return
+    }
+
+    let now = Date()
+    if let lastAttempt = lastSwitchAttemptDate,
+       now.timeIntervalSince(lastAttempt) < Timing.rapidSwitchWindow {
+      rapidSwitchCount += 1
+    } else {
+      rapidSwitchCount = 1
+    }
+    lastSwitchAttemptDate = now
 
     guard let status = system.selectInputSource(id: targetID) else {
+      cachedSelectableSources = nil
+      consecutiveEnforceFailures = 0
       log.error("Target input source not found: \(targetID, privacy: .public)")
       return
     }
 
     if status != noErr {
+      consecutiveEnforceFailures += 1
       log.error("TISSelectInputSource failed: \(status, privacy: .public) reason=\(reason, privacy: .public)")
     } else {
+      consecutiveEnforceFailures = 0
       log.debug("Switched input source: \(targetID, privacy: .public) reason=\(reason, privacy: .public)")
     }
   }
@@ -220,29 +389,74 @@ final class InputSourceLockService {
     }
   }
 
+  static func migrateLegacyDefaults(from legacy: [String: Any], to defaults: UserDefaults) {
+    guard defaults.object(forKey: DefaultsKey.enabled) == nil,
+          defaults.object(forKey: DefaultsKey.targetID) == nil else { return }
+    if let enabled = legacy[DefaultsKey.enabled] as? Bool {
+      defaults.set(enabled, forKey: DefaultsKey.enabled)
+    }
+    if let targetID = legacy[DefaultsKey.targetID] as? String {
+      defaults.set(targetID, forKey: DefaultsKey.targetID)
+    }
+  }
+
+  private func migrateLegacyDefaultsIfNeeded() {
+    guard defaults === UserDefaults.standard else { return }
+    guard let legacy = defaults.persistentDomain(forName: AppConstants.legacyBundleIdentifier) else { return }
+    Self.migrateLegacyDefaults(from: legacy, to: defaults)
+  }
+
   @objc private func inputSourceChanged(_ notification: Notification) {
-    enforce(reason: "inputSourceChanged")
-    notifyStateChanged()
+    if isEnabled {
+      enforce(reason: "inputSourceChanged")
+    }
+    notifyStateChangedIfNeeded()
   }
 
   @objc private func inputSourcesEnabledChanged(_ notification: Notification) {
     cachedSelectableSources = nil
     autoPickWeChatIfNeeded()
-    enforce(reason: "inputSourcesEnabledChanged")
-    notifyStateChanged()
+    if isEnabled {
+      enforce(reason: "inputSourcesEnabledChanged")
+    }
+    notifyStateChangedIfNeeded()
   }
 
   @objc private func activeAppChanged(_ notification: Notification) {
-    enforce(reason: "activeAppChanged")
-    notifyStateChanged()
+    if isEnabled {
+      enforce(reason: "activeAppChanged")
+    }
+    notifyStateChangedIfNeeded()
+  }
+
+  @objc private func systemDidWake(_ notification: Notification) {
+    cachedSelectableSources = nil
+    resetEnforceBackoff()
+    autoPickWeChatIfNeeded()
+    if isEnabled {
+      enforce(reason: "systemDidWake")
+    }
+    notifyStateChangedIfNeeded()
   }
 
   private func handlePeriodicCheck() {
     guard isEnabled else { return }
-    // Also refresh the list as a fallback for missed distributed notifications.
-    cachedSelectableSources = nil
-    autoPickWeChatIfNeeded()
+    if targetInputSourceID == nil || targetInputSource() == nil {
+      // Refresh list only when target is unset or missing, as a fallback for missed notifications.
+      cachedSelectableSources = nil
+      autoPickWeChatIfNeeded()
+    }
     enforce(reason: "periodicCheck")
+  }
+
+  private func computeLockStatus(current: InputSource?, selectableSources: [InputSource]?) -> LockStatus {
+    guard isEnabled else { return .disabled }
+    guard let targetID = targetInputSourceID else { return .noTarget }
+    let available = selectableSources ?? self.selectableInputSources()
+    guard available.contains(where: { $0.id == targetID }) else { return .targetUnavailable }
+    guard !isSecureInputEnabled else { return .paused }
+    guard !isCurrentAppExcluded else { return .pausedForApp }
+    return current?.id == targetID ? .locked : .restoring
   }
 
   private func matchesWeChatByName(_ source: InputSource) -> Bool {
@@ -255,7 +469,18 @@ final class InputSourceLockService {
     return normalizedID.contains("tencent") || normalizedID.contains("wechat")
   }
 
-  private func notifyStateChanged() {
+  private func notifyStateChangedIfNeeded() {
+    let current = currentInputSource()
+    let snapshot = ObservedState(
+      isEnabled: isEnabled,
+      targetInputSourceID: targetInputSourceID,
+      lockStatus: computeLockStatus(current: current, selectableSources: nil),
+      currentInputSourceID: current?.id,
+      currentInputSourceName: current?.name
+    )
+    guard snapshot != lastNotifiedState else { return }
+    lastNotifiedState = snapshot
+
     let handlers: [() -> Void] = handlerQueue.sync {
       Array(stateChangeHandlers.values)
     }

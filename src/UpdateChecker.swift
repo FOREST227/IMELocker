@@ -58,9 +58,11 @@ final class UpdateChecker {
     }
     pending.append(completion)
     guard task == nil else { return }
-    var request = URLRequest(url: URL(string: "https://api.github.com/repos/Forest227/IMELocker/releases/latest")!)
-    request.timeoutInterval = 3
+    var request = URLRequest(url: AppConstants.latestReleaseAPIURL)
+    request.timeoutInterval = 8
     request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+    let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
+    request.setValue("IMELocker/\(version)", forHTTPHeaderField: "User-Agent")
     task = session.dataTask(with: request) { [weak self] data, response, error in
       var version: String?
       if error == nil, let response = response as? HTTPURLResponse, response.statusCode == 200,

@@ -5,9 +5,12 @@ cd "${ROOT_DIR}"
 TAG="${1:?Usage: publish_release.sh TAG}"
 VERSION="${TAG#v}"
 ASSETS=()
+DMG_NAMES=()
 for arch in universal x86_64 arm64; do
-  asset="build/IMELocker-v${VERSION}-${arch}.dmg"
+  name="IMELocker-v${VERSION}-${arch}.dmg"
+  asset="build/${name}"
   [[ -f "${asset}" ]] || { echo "error: Missing ${asset}" >&2; exit 1; }
+  DMG_NAMES+=("${name}")
   ASSETS+=("${asset}")
 done
 
@@ -20,6 +23,14 @@ if IS_DRAFT="$(gh release view "${TAG}" --json isDraft --jq '.isDraft' 2>/dev/nu
 else
   IS_DRAFT=missing
 fi
+
+CHECKSUM_FILE="build/SHA256SUMS.txt"
+if command -v shasum >/dev/null 2>&1; then
+  (cd build && shasum -a 256 "${DMG_NAMES[@]}") > "${CHECKSUM_FILE}"
+else
+  (cd build && sha256sum "${DMG_NAMES[@]}") > "${CHECKSUM_FILE}"
+fi
+ASSETS+=("${CHECKSUM_FILE}")
 
 NOTES_FILE="docs/releases/${TAG}.md"
 if [[ ! -f "${NOTES_FILE}" ]]; then

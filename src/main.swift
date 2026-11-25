@@ -1,5 +1,9 @@
 import Cocoa
 
+if SingleInstanceGuard.shouldExit() {
+  exit(0)
+}
+
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
