@@ -33,6 +33,13 @@ final class FakeFrontmostAppProvider: FrontmostAppProvider {
   func frontmostApp() -> RunningAppInfo? { currentApp }
 }
 
+final class FakeUserActivityProvider: UserActivityProvider {
+  var idleSeconds: TimeInterval = 10.0
+  var hasActiveModifierKeys = false
+  var hasPressedMouseButtons = false
+  func secondsSinceLastKeyboardActivity() -> TimeInterval { idleSeconds }
+}
+
 private func waitUntil(_ message: String, timeout: TimeInterval = 2, _ predicate: () -> Bool) {
   let deadline = Date().addingTimeInterval(timeout)
   while !predicate() && Date() < deadline {
@@ -98,12 +105,14 @@ struct RegressionTests {
     let notifications = TestDistributedCenter()
     let workspaceNotifications = NotificationCenter()
     let frontmostProvider = FakeFrontmostAppProvider()
+    let userActivityProvider = FakeUserActivityProvider()
     let service = InputSourceLockService(
       defaults: defaults,
       system: system,
       notificationCenter: notifications,
       workspaceNotificationCenter: workspaceNotifications,
-      frontmostAppProvider: frontmostProvider
+      frontmostAppProvider: frontmostProvider,
+      userActivityProvider: userActivityProvider
     )
     runMenuTests(lockService: service)
     expect(service.lockStatus == .noTarget, "empty preferences cannot report locked")
@@ -184,20 +193,95 @@ struct RegressionTests {
     system.selectStatus = OSStatus(-50)
     system.current = InputSource(id: "test.abc", name: "ABC")
     service.enforceSync(reason: "fail-1")
-    expect(service.currentEnforceDelay() >= 0.05, "first failure backs off enforce delay")
+    expect(service.currentEnforceDelay() >= 0.10, "first failure backs off enforce delay")
     service.enforceSync(reason: "fail-2")
-    expect(service.currentEnforceDelay() >= 0.10, "consecutive failures increase backoff")
+    expect(service.currentEnforceDelay() >= 0.20, "consecutive failures increase backoff")
     system.selectStatus = noErr
     service.enforceSync(reason: "recover")
-    expect(system.current.id == "test.ime" && service.currentEnforceDelay() == 0.01, "recovery resets failure backoff")
+    expect(system.current.id == "test.ime" && service.currentEnforceDelay() == InputSourceLockService.defaultEnforceDelay,
+           "recovery resets failure backoff")
 
     for _ in 0..<5 {
       system.current = InputSource(id: "test.abc", name: "ABC")
       service.enforceSync(reason: "bounce")
     }
-    expect(service.currentEnforceDelay() >= 0.05, "rapid bounce loop backs off enforce delay")
+    expect(service.currentEnforceDelay() >= 0.10, "rapid bounce loop backs off enforce delay")
     service.lock(to: "test.ime", reason: "reset-backoff")
-    expect(service.currentEnforceDelay() == 0.01, "explicit lock resets backoff")
+    expect(service.currentEnforceDelay() == InputSourceLockService.defaultEnforceDelay, "explicit lock resets backoff")
+
+    // Active typing strictly refuses background restoration until typing pauses.
+    userActivityProvider.idleSeconds = 0.05
+    system.current = InputSource(id: "test.abc", name: "ABC")
+    notifications.deliver(kTISNotifySelectedKeyboardInputSourceChanged)
+    RunLoop.main.run(until: Date().addingTimeInterval(0.25))
+    expect(system.current.id == "test.abc", "active typing refuses automatic input source restoration")
+    userActivityProvider.idleSeconds = 1.0
+    waitUntil("restores target after typing pauses", timeout: 1.5) {
+      system.current.id == "test.ime"
+    }
+
+    // Holding modifier keys (e.g. Shift / Command) strictly refuses switching until released.
+    userActivityProvider.hasActiveModifierKeys = true
+    system.current = InputSource(id: "test.abc", name: "ABC")
+    notifications.deliver(kTISNotifySelectedKeyboardInputSourceChanged)
+    RunLoop.main.run(until: Date().addingTimeInterval(0.35))
+    expect(system.current.id == "test.abc", "held modifier key refuses switching")
+    userActivityProvider.hasActiveModifierKeys = false
+    waitUntil("restores target after modifier key is released", timeout: 1.5) {
+      system.current.id == "test.ime"
+    }
+
+    // Holding mouse buttons (e.g. selecting text or clicking candidates) strictly refuses switching until released.
+    userActivityProvider.hasPressedMouseButtons = true
+    system.current = InputSource(id: "test.abc", name: "ABC")
+    notifications.deliver(kTISNotifySelectedKeyboardInputSourceChanged)
+    RunLoop.main.run(until: Date().addingTimeInterval(0.35))
+    expect(system.current.id == "test.abc", "pressed mouse button refuses switching")
+    userActivityProvider.hasPressedMouseButtons = false
+    waitUntil("restores target after mouse button is released", timeout: 1.5) {
+      system.current.id == "test.ime"
+    }
+
+    // Mode-enabled parent containers are filtered out when their concrete child modes exist.
+    let filteredSources = CarbonInputSourceSystem.filterSelectableSources([
+      .init(id: "com.tencent.inputmethod.wetype", name: "微信输入法", isModeEnabledParent: true, isInputMode: false),
+      .init(id: "com.tencent.inputmethod.wetype.pinyin", name: "微信输入法", isModeEnabledParent: false, isInputMode: true),
+      .init(id: "com.example.standalone", name: "Standalone IME", isModeEnabledParent: true, isInputMode: false),
+      .init(id: "com.apple.keylayout.ABC", name: "ABC", isModeEnabledParent: false, isInputMode: false),
+    ])
+    expect(filteredSources.map(\.id) == [
+      "com.apple.keylayout.ABC",
+      "com.example.standalone",
+      "com.tencent.inputmethod.wetype.pinyin",
+    ], "redundant mode-enabled parent container must be filtered out")
+
+    // Legacy saved parent target ID automatically upgrades to its child input mode,
+    // and reporting the parent ID as current must not trigger redundant re-selection.
+    let upgradeSuite = "IMELocker.parent-upgrade.\(UUID().uuidString)"
+    let upgradeDefaults = UserDefaults(suiteName: upgradeSuite)!
+    defer { upgradeDefaults.removePersistentDomain(forName: upgradeSuite) }
+    upgradeDefaults.set("com.tencent.inputmethod.wetype", forKey: "targetInputSourceID")
+    let upgradeSystem = FakeInputSystem()
+    upgradeSystem.sources = [
+      InputSource(id: "com.tencent.inputmethod.wetype.pinyin", name: "微信输入法"),
+      InputSource(id: "com.apple.keylayout.ABC", name: "ABC"),
+    ]
+    upgradeSystem.current = InputSource(id: "com.tencent.inputmethod.wetype", name: "微信输入法")
+    let upgradeService = InputSourceLockService(
+      defaults: upgradeDefaults,
+      system: upgradeSystem,
+      notificationCenter: TestDistributedCenter(),
+      workspaceNotificationCenter: NotificationCenter(),
+      frontmostAppProvider: FakeFrontmostAppProvider(),
+      userActivityProvider: FakeUserActivityProvider()
+    )
+    upgradeService.start()
+    expect(upgradeService.targetInputSourceID == "com.tencent.inputmethod.wetype.pinyin",
+           "saved parent target ID must upgrade to concrete child input mode")
+    expect(upgradeService.lockStatus == .locked, "parent container as current counts as locked")
+    upgradeService.enforceSync(reason: "parent-match")
+    expect(upgradeSystem.selections.isEmpty, "matching parent container must not re-select")
+    upgradeService.isEnabled = false
 
     let terminal = RunningAppInfo(bundleIdentifier: "com.apple.Terminal", localizedName: "Terminal")
     let safari = RunningAppInfo(bundleIdentifier: "com.apple.Safari", localizedName: "Safari")

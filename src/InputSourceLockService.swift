@@ -8,14 +8,35 @@ struct InputSource: Hashable {
 }
 
 final class InputSourceLockService {
+  static let defaultEnforceDelay: TimeInterval = 0.08
+
   private enum Timing {
-    static let enforceDelay: TimeInterval = 0.01
+    static let enforceDelay: TimeInterval = InputSourceLockService.defaultEnforceDelay
     static let periodicCheckInterval: TimeInterval = 5.0
     static let periodicCheckTolerance: TimeInterval = 0.5
     static let rapidSwitchWindow: TimeInterval = 2.5
     static let maxRapidSwitchesBeforeBackoff = 4
-    static let backoffBaseDelay: TimeInterval = 0.05
+    static let backoffBaseDelay: TimeInterval = 0.1
     static let maxBackoffDelay: TimeInterval = 2.0
+    static let backgroundTypingQuietWindow: TimeInterval = 0.6
+    static let appSwitchTypingQuietWindow: TimeInterval = 0.25
+    static let interactionRecheckDelay: TimeInterval = 0.2
+    static let typingRecheckMargin: TimeInterval = 0.05
+    static let postSwitchCooldown: TimeInterval = 0.3
+  }
+
+  private enum TypingGuard {
+    case none
+    case brief
+    case strict
+
+    var quietWindow: TimeInterval {
+      switch self {
+      case .none: return 0
+      case .brief: return Timing.appSwitchTypingQuietWindow
+      case .strict: return Timing.backgroundTypingQuietWindow
+      }
+    }
   }
 
   private struct ObservedState: Equatable {
@@ -32,9 +53,11 @@ final class InputSourceLockService {
   private let systemNotificationCenter: DistributedNotificationCenter
   private let workspaceNotificationCenter: NotificationCenter
   private let frontmostAppProvider: FrontmostAppProvider
+  private let userActivityProvider: UserActivityProvider
   private var enforceWorkItem: DispatchWorkItem?
   private var periodicCheckTimer: Timer?
   private var hasStarted = false
+  private var isEnforcing = false
 
   private let handlerQueue = DispatchQueue(label: "com.forest227.IMELocker.handlers")
   private var stateChangeHandlers: [UUID: () -> Void] = [:]
@@ -43,6 +66,7 @@ final class InputSourceLockService {
   private var consecutiveEnforceFailures = 0
   private var rapidSwitchCount = 0
   private var lastSwitchAttemptDate: Date?
+  private var lastSuccessfulSwitchDate: Date?
 
   // 输入法列表缓存，在 kTISNotifyEnabledKeyboardInputSourcesChanged、菜单打开或系统唤醒时失效
   private var cachedSelectableSources: [InputSource]?
@@ -59,13 +83,15 @@ final class InputSourceLockService {
     system: InputSourceSystem = CarbonInputSourceSystem(),
     notificationCenter: DistributedNotificationCenter = .default(),
     workspaceNotificationCenter: NotificationCenter = NSWorkspace.shared.notificationCenter,
-    frontmostAppProvider: FrontmostAppProvider = WorkspaceFrontmostAppProvider()
+    frontmostAppProvider: FrontmostAppProvider = WorkspaceFrontmostAppProvider(),
+    userActivityProvider: UserActivityProvider = CoreGraphicsUserActivityProvider()
   ) {
     self.defaults = defaults
     self.system = system
     self.systemNotificationCenter = notificationCenter
     self.workspaceNotificationCenter = workspaceNotificationCenter
     self.frontmostAppProvider = frontmostAppProvider
+    self.userActivityProvider = userActivityProvider
     migrateLegacyDefaultsIfNeeded()
   }
 
@@ -132,6 +158,7 @@ final class InputSourceLockService {
     guard !hasStarted else { return }
     hasStarted = true
 
+    normalizeTargetInputSourceIfNeeded()
     autoPickWeChatIfNeeded()
     observeSystemNotifications()
     startPeriodicCheck()
@@ -297,11 +324,11 @@ final class InputSourceLockService {
   }
 
   func enforce(reason: String) {
-    scheduleEnforce(reason: reason)
+    scheduleEnforce(reason: reason, typingGuard: .strict)
   }
 
   func enforceSync(reason: String) {
-    enforceNow(reason: reason)
+    enforceNow(reason: reason, typingGuard: .none)
   }
 
   func currentEnforceDelay(now: Date = Date()) -> TimeInterval {
@@ -323,32 +350,57 @@ final class InputSourceLockService {
     consecutiveEnforceFailures = 0
     rapidSwitchCount = 0
     lastSwitchAttemptDate = nil
+    lastSuccessfulSwitchDate = nil
   }
 
-  private func scheduleEnforce(reason: String) {
+  private func scheduleEnforce(
+    reason: String,
+    typingGuard: TypingGuard,
+    delayOverride: TimeInterval? = nil
+  ) {
     enforceWorkItem?.cancel()
-    let delay = currentEnforceDelay()
+    let delay = delayOverride ?? currentEnforceDelay()
     let item = DispatchWorkItem { [weak self] in
-      self?.enforceNow(reason: reason)
+      self?.enforceNow(reason: reason, typingGuard: typingGuard)
     }
     enforceWorkItem = item
     DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
   }
 
-  private func enforceNow(reason: String) {
-    defer { notifyStateChangedIfNeeded() }
+  private func enforceNow(reason: String, typingGuard: TypingGuard = .none) {
+    guard !isEnforcing else { return }
+    isEnforcing = true
+    defer {
+      isEnforcing = false
+      notifyStateChangedIfNeeded()
+    }
     guard isEnabled else { return }
     guard !isSecureInputEnabled else { return }
     guard !isCurrentAppExcluded else { return }
     guard let targetID = targetInputSourceID else { return }
 
     let current = currentInputSource()
-    if current?.id == targetID {
+    if isCurrentAlreadyWithinTarget(currentID: current?.id, targetID: targetID) {
       consecutiveEnforceFailures = 0
       return
     }
 
+    if let deferDelay = interactionDeferDelay(for: typingGuard) {
+      scheduleEnforce(reason: reason, typingGuard: typingGuard, delayOverride: deferDelay)
+      return
+    }
+
     let now = Date()
+    if typingGuard != .none,
+       let lastSuccess = lastSuccessfulSwitchDate {
+      let elapsed = now.timeIntervalSince(lastSuccess)
+      if elapsed < Timing.postSwitchCooldown {
+        let remaining = max(Timing.enforceDelay, Timing.postSwitchCooldown - elapsed)
+        scheduleEnforce(reason: reason, typingGuard: typingGuard, delayOverride: remaining)
+        return
+      }
+    }
+
     if let lastAttempt = lastSwitchAttemptDate,
        now.timeIntervalSince(lastAttempt) < Timing.rapidSwitchWindow {
       rapidSwitchCount += 1
@@ -369,7 +421,39 @@ final class InputSourceLockService {
       log.error("TISSelectInputSource failed: \(status, privacy: .public) reason=\(reason, privacy: .public)")
     } else {
       consecutiveEnforceFailures = 0
+      lastSuccessfulSwitchDate = now
       log.debug("Switched input source: \(targetID, privacy: .public) reason=\(reason, privacy: .public)")
+    }
+  }
+
+  /// Strictly refuses automatic switching while the user is typing, holding modifier keys,
+  /// or pressing mouse buttons (e.g. selecting text or clicking an IME candidate).
+  private func interactionDeferDelay(for typingGuard: TypingGuard) -> TimeInterval? {
+    guard typingGuard != .none else { return nil }
+    if userActivityProvider.hasActiveModifierKeys || userActivityProvider.hasPressedMouseButtons {
+      return Timing.interactionRecheckDelay
+    }
+    let idleSeconds = userActivityProvider.secondsSinceLastKeyboardActivity()
+    let quietWindow = typingGuard.quietWindow
+    if idleSeconds < quietWindow {
+      return max(Timing.enforceDelay, quietWindow - idleSeconds + Timing.typingRecheckMargin)
+    }
+    return nil
+  }
+
+  private func isCurrentAlreadyWithinTarget(currentID: String?, targetID: String) -> Bool {
+    guard let currentID else { return false }
+    return currentID == targetID || targetID.hasPrefix(currentID + ".")
+  }
+
+  private func normalizeTargetInputSourceIfNeeded() {
+    guard let savedID = targetInputSourceID else { return }
+    let sources = selectableInputSources()
+    guard !sources.contains(where: { $0.id == savedID }) else { return }
+    let prefix = savedID + "."
+    if let childMode = sources.first(where: { $0.id.hasPrefix(prefix) }) {
+      defaults.set(childMode.id, forKey: DefaultsKey.targetID)
+      log.debug("Upgraded parent target input source \(savedID, privacy: .public) to mode \(childMode.id, privacy: .public)")
     }
   }
 
@@ -408,23 +492,24 @@ final class InputSourceLockService {
 
   @objc private func inputSourceChanged(_ notification: Notification) {
     if isEnabled {
-      enforce(reason: "inputSourceChanged")
+      scheduleEnforce(reason: "inputSourceChanged", typingGuard: .strict)
     }
     notifyStateChangedIfNeeded()
   }
 
   @objc private func inputSourcesEnabledChanged(_ notification: Notification) {
     cachedSelectableSources = nil
+    normalizeTargetInputSourceIfNeeded()
     autoPickWeChatIfNeeded()
     if isEnabled {
-      enforce(reason: "inputSourcesEnabledChanged")
+      scheduleEnforce(reason: "inputSourcesEnabledChanged", typingGuard: .strict)
     }
     notifyStateChangedIfNeeded()
   }
 
   @objc private func activeAppChanged(_ notification: Notification) {
     if isEnabled {
-      enforce(reason: "activeAppChanged")
+      scheduleEnforce(reason: "activeAppChanged", typingGuard: .brief)
     }
     notifyStateChangedIfNeeded()
   }
@@ -432,9 +517,10 @@ final class InputSourceLockService {
   @objc private func systemDidWake(_ notification: Notification) {
     cachedSelectableSources = nil
     resetEnforceBackoff()
+    normalizeTargetInputSourceIfNeeded()
     autoPickWeChatIfNeeded()
     if isEnabled {
-      enforce(reason: "systemDidWake")
+      scheduleEnforce(reason: "systemDidWake", typingGuard: .brief)
     }
     notifyStateChangedIfNeeded()
   }
@@ -444,9 +530,10 @@ final class InputSourceLockService {
     if targetInputSourceID == nil || targetInputSource() == nil {
       // Refresh list only when target is unset or missing, as a fallback for missed notifications.
       cachedSelectableSources = nil
+      normalizeTargetInputSourceIfNeeded()
       autoPickWeChatIfNeeded()
     }
-    enforce(reason: "periodicCheck")
+    scheduleEnforce(reason: "periodicCheck", typingGuard: .strict)
   }
 
   private func computeLockStatus(current: InputSource?, selectableSources: [InputSource]?) -> LockStatus {
@@ -456,7 +543,7 @@ final class InputSourceLockService {
     guard available.contains(where: { $0.id == targetID }) else { return .targetUnavailable }
     guard !isSecureInputEnabled else { return .paused }
     guard !isCurrentAppExcluded else { return .pausedForApp }
-    return current?.id == targetID ? .locked : .restoring
+    return isCurrentAlreadyWithinTarget(currentID: current?.id, targetID: targetID) ? .locked : .restoring
   }
 
   private func matchesWeChatByName(_ source: InputSource) -> Bool {

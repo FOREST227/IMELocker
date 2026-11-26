@@ -37,7 +37,22 @@ STAGING_DIR="$(mktemp -d "${BUILD_DIR}/dmg-root.XXXXXX")"
 trap 'rm -rf "${STAGING_DIR}"' EXIT
 cp -R "${APP_PATH}" "${STAGING_DIR}/"
 ln -s /Applications "${STAGING_DIR}/Applications"
-hdiutil create -volname "${APP_NAME}" -srcfolder "${STAGING_DIR}" -ov \
+retry_hdiutil() {
+  local attempt=1
+  while true; do
+    if "$@"; then
+      return 0
+    fi
+    if [[ "${attempt}" -ge 3 ]]; then
+      return 1
+    fi
+    echo "warn: hdiutil failed (attempt ${attempt}/3), retrying..." >&2
+    sleep 2
+    attempt=$((attempt + 1))
+  done
+}
+
+retry_hdiutil hdiutil create -volname "${APP_NAME}" -srcfolder "${STAGING_DIR}" -ov \
   -format UDZO -imagekey zlib-level=9 "${DMG_PATH}"
-hdiutil verify "${DMG_PATH}"
+retry_hdiutil hdiutil verify "${DMG_PATH}"
 echo "Built: ${DMG_PATH}"
